@@ -1,0 +1,11 @@
+[package]
+name = "cloudiful-authz"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+casbin = { version = "2.20.0", default-features = false, features = ["runtime-tokio"] }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["macros", "rt"] }
