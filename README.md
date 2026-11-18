@@ -22,6 +22,11 @@ database, or policy administration UI.
   credential and server attenuation.
 - Registered resource/action names come only from role capabilities and
   public-read grants; credential or server grants cannot register names.
+- `Authorizer::authorize_with_roles` accepts trusted per-request roles resolved
+  from current introspection or SQL, without rebuilding the engine or reading
+  stale assignment snapshots. It binds those roles to the full principal and
+  exact request domain and still applies audience, credential, and server
+  restrictions.
 - Unknown domains, resources, actions, stale facts, and engine errors deny.
   Malformed service audiences and credential audience mismatches deny.
 - Row-level SQL visibility, leases, approvals, quotas, and IP rules remain
@@ -33,6 +38,13 @@ owns freshness: it must supply a revision from authoritative current data,
 refresh at membership or admin changes, and keep live per-request checks where
 a snapshot cannot meet its consistency requirements. Revision comparison alone
 does not make a dynamic membership adapter current.
+
+For live-fact consumers, `authorize_with_roles` takes a caller-resolved
+`ResolvedRoles` bound to the full principal and exact domain. It evaluates the
+roles through the same Casbin capabilities without mutating or rebuilding the
+engine, never falls back to snapshot assignments, and leaves credential and
+server attenuation mandatory. The caller owns live freshness; the core adds no
+revision database or invalidation service.
 
 ## Usage
 
@@ -90,8 +102,9 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Runnable examples are in [`examples/`](examples): a minimal service principal
-and a domain member inheriting a parent assignment.
+Runnable examples are in [`examples/`](examples): a minimal service principal,
+a domain member inheriting a parent assignment, and a live-resolved-role
+decision that changes on the next request without rebuilding the engine.
 
 ## Documentation
 

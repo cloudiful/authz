@@ -1,10 +1,10 @@
 # Consumer mapping
 
-Status: P0 design record, revised after parent review of record 5618; the P1
-core library is implemented, but no consumer migration is. This document
-separates behavior verified by reading the named source files from target
-design and from paths that were not inspected. No consumer was modified, built,
-or run for this mapping.
+Status: consumer mapping for the implemented core (P1 snapshot API plus the P2
+trusted live-resolved-role entrypoint). No consumer migration is implemented.
+This document separates behavior verified by reading the named source files
+from target design and from paths that were not inspected. No consumer was
+modified, built, or run for this mapping.
 
 ## 1. Evidence and confidence
 
@@ -105,20 +105,24 @@ mapping below never relies on a bare id for identity.
   the actor does not hold requires the delegation checks in
   `authorization-model.md` section 7. This is stricter than current behavior.
 - Admin scope no longer implies private group data or every content action.
-- **Freshness blocker:** Context69 currently resolves group membership from
-  live SQL. A long-lived assignment snapshot cannot be used for these decisions
-  without a concrete revision source and admission check. P1 adds
-  `FactsRevision` and `StaleFacts`, but does not implement a live-facts adapter
-  or distributed invalidation. Wave A must either keep the live SQL group check
-  while using the shared static capability schema, or define and approve a
-  refresh boundary. It must not silently rebuild full Casbin per request.
+- **Freshness:** Context69 resolves group membership from live SQL per request.
+  The P2 `Authorizer::authorize_with_roles` entrypoint fits that shape: the
+  consumer keeps its live SQL membership read and passes trusted
+  `ResolvedRoles` for the full principal and exact group domain. The core then
+  applies its registered role capabilities and the shared audience, credential,
+  and server checks without rebuilding the engine or relying on a snapshot
+  revision. This removes the core-side blocker for live membership decisions.
+  The consumer still owns freshness and admission: it must resolve roles from
+  verified current data, never from client claims or an old cached snapshot.
+  The core provides no revision database or distributed invalidation.
 
 **Wave A.** Do not rewrite Context69 PR104. After the shared crate is delivered
 at an immutable revision, replace the local rank comparator with the shared
-domain-role adapter only where the facts path is settled. Keep the existing SQL
-inheritance query as the trusted assignment source until a scoped migration
-removes the duplicate policy. Dynamic group membership remains on live facts
-until its refresh/admission design is approved.
+domain-role adapter where the live path is settled. Keep the existing SQL
+inheritance query as the trusted role source and pass its result through
+`authorize_with_roles`; do not move group membership to a long-lived snapshot
+and do not rebuild Casbin per request. Remove the duplicate policy only in a
+scoped migration.
 
 ### 3.2 stock-goes-stonk
 
@@ -287,8 +291,11 @@ resource limits untouched.
 - The duplicated function should be deleted only when both factor and import
   migrate through a scoped issue.
 
-**Wave A.** Can migrate with stock-import and gateway after the shared crate is
-available.
+**Wave A deferral.** Do not start stock-factor migration in this wave. Its
+worktree has no `HEAD` and its files are untracked, so there is no immutable
+revision to pin or diff against. It stays on its legacy behaviour until the
+repository has a committed baseline; do not initialize, commit, or sweep that
+working tree as part of this mapping.
 
 ### 3.6 stock-import
 
@@ -305,7 +312,12 @@ available.
 per-handler `is_admin` scoping must be enumerated as capabilities rather than
 replaced blindly. Legacy admin exceptions stay explicit.
 
-**Wave A.** Migrate with stock-factor and gateway.
+**Wave A.** This is the first eligible consumer. Its committed revision
+(`f8ed587`) has a verifiable baseline, so it can migrate together with the
+gateway contract revision it actually pins. Adoption uses the live-resolved
+role path for its introspection-derived identity, preserves the current
+`is_admin` plus bearer `admin_data` conjunction as explicit capabilities and
+typed grants, and keeps per-handler admin scoping enumerated.
 
 ### 3.7 stock-gateway
 
@@ -340,7 +352,11 @@ replaced blindly. Legacy admin exceptions stay explicit.
 - Any change to administrator authority needs user approval.
 
 **Wave A coordination.** Gateway contract changes precede or accompany
-factor/import migration. Do not change the snapshot/HTTP contract silently.
+stock-import migration. Do not change the snapshot/HTTP contract silently.
+Consumers pin different gateway contract revisions (the revisions listed in
+section 1); preserve each pinned contract and verify that the fields a consumer
+reads are compatible before changing it. Do not assume one shared revision
+across the Stock consumers.
 
 ### 3.8 gov-info
 
@@ -377,11 +393,13 @@ Casbin or a role model to them artificially.
 1. **Shared crate delivery (P1).** Freeze the API and tests from
    `authorization-model.md`; deliver an immutable revision or tag. No consumer
    writes.
-2. **Wave A.** Context69 adapter, stock-factor, stock-import, and stock-gateway
-   credential/capability mapping. Context69 uses its existing SQL as trusted
-   fact source where live-facts freshness is retained; do not rewrite PR104.
-   Factor/import/gateway remove the duplicate `admin_data` interpretation only
-   through scoped issues.
+2. **Wave A.** Context69 adapter, stock-import, and stock-gateway
+   credential/capability mapping. Context69 keeps its existing SQL membership
+   query as the trusted role source and calls the live-resolved-role entrypoint;
+   do not rewrite PR104. stock-import is the first eligible migration because
+   it has a committed baseline; stock-factor is deferred until it has one. The
+   gateway contract revision each consumer pins is preserved. Duplicate
+   `admin_data` interpretation is removed only through scoped issues.
 3. **Wave B.** Stock full HTTP/MCP/project migration and desk
    machine/workspace/ceiling migration. Preserve SQL visibility, public/system
    attributes, legacy workspace shell, limits, and leases.
@@ -418,8 +436,10 @@ trust is assumed.
 The detailed list is in `authorization-model.md` section 17. The blocking ones
 for migration are:
 
-1. Context69 dynamic-facts architecture: revisioned snapshot boundary, live
-   facts in the consumer, or a future live-facts API.
+1. Context69 live-facts admission ownership: the core live-resolved-role path
+   exists, so the remaining choice is how the consumer guarantees that resolved
+   roles come from verified current data. A revisioned snapshot boundary is no
+   longer required for these decisions.
 2. Context69 maintainer-to-owner delegation restriction (target is stricter
    than current behavior).
 3. Enumerated administrator capability sets for Context69, Stock, Stock

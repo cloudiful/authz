@@ -152,6 +152,13 @@ pub struct ResourceRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRoles {
+    pub principal: PrincipalRef,
+    pub domain: DomainId,
+    pub roles: BTreeSet<RoleId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthzRequest {
     pub subject: Subject,
     pub domain: DomainId,
@@ -172,6 +179,10 @@ pub enum DenyReason {
     NoSubjectAuthority,
     StaleFacts,
     InvalidAudience,
+    PublicReadNotAllowed,
+    LivePrincipalMismatch,
+    LiveDomainMismatch,
+    UnknownRole,
     CredentialPrincipalMismatch,
     CredentialAudienceMismatch,
     CredentialGrantMissing,
