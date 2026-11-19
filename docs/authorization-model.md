@@ -391,7 +391,7 @@ before authority evaluation. It does not obtain the current revision itself.
 
 A consumer must obtain the current revision before admitting a request to a
 snapshot decision. The revision source is the consumer's responsibility: a
-transactional policy-revision row, a monotic local revision bumped on every
+transactional policy-revision row, a monotonic local revision bumped on every
 membership/admin change, or another trusted mechanism. If the consumer cannot
 obtain a current revision, it must not use a long-lived snapshot for that
 decision.
@@ -415,9 +415,47 @@ implementation.
 ### API consequence
 
 The revision fields and `DenyReason::StaleFacts` are part of the implemented
-minimal API. The live-facts path remains unresolved for consumers that cannot
-supply a current revision; those consumers keep their existing live check in the
-migration instead of pretending a snapshot is current.
+minimal API for snapshot decisions.
+
+### Trusted live-resolved roles
+
+The core also exposes a live-fact entrypoint for consumers that already resolve
+current roles from trusted introspection or SQL. It does not tighten or replace
+the snapshot API.
+
+- `ResolvedRoles` carries the full `PrincipalRef`, the exact `DomainId`, and the
+  `BTreeSet<RoleId>` resolved for that principal in that domain. This is
+  trusted server-resolved data, never a client token role claim.
+- `Authorizer::authorize_with_roles(&AuthzRequest, &ResolvedRoles)` accepts the
+  principal subject only. `Subject::PublicRead` is rejected with
+  `PublicReadNotAllowed`; public-read continues through the existing public
+  authority branch without resolved role input.
+- The resolved principal and domain must equal the request principal and
+  request domain. A mismatch denies with `LivePrincipalMismatch` or
+  `LiveDomainMismatch`. Unknown roles deny the entire request with
+  `UnknownRole`; empty roles deny authority with `NoSubjectAuthority`.
+- The live entrypoint intentionally skips assignment-snapshot revision
+  equality because authority is supplied live. It never falls back to the
+  snapshot assignments, never unions live roles with snapshot roles, and never
+  reads `g` rows for subject authority.
+- Static role schema and registered domains still apply. A new or unknown
+  domain denies until the policy lifecycle registers it.
+- Live roles are evaluated against the same Casbin role policies through an
+  explicit role-subject evaluation path in the fixed model. The encoded role
+  identity is used directly; no `g` row is inserted or mutated, no enforcer is
+  built per request, and no Rust capability-set membership replaces the engine.
+  Domain-local role assertions are trusted request facts, not stored
+  principal-role relationships.
+- Multiple resolved roles are ORed for subject authority only. Credential and
+  server attenuation are always ANDed and cannot be bypassed by an
+  administrative role.
+- The caller owns live freshness. It must resolve roles from verified current
+  data for that request, never from unverified client claims or an old
+  assignment snapshot. The core adds no revision database, cache, TTL, or
+  invalidation mechanism.
+
+The snapshot `authorize` entrypoint keeps its existing `FactsRevision` equality
+check and real Casbin `g` domain semantics unchanged.
 
 ## 12. Lists, queries, and row visibility
 
@@ -563,6 +601,12 @@ pub struct ResourceRef {
     pub domain: DomainId,
 }
 
+pub struct ResolvedRoles {
+    pub principal: PrincipalRef,
+    pub domain: DomainId,
+    pub roles: BTreeSet<RoleId>,
+}
+
 pub struct AuthzRequest {
     pub subject: Subject,
     pub domain: DomainId,
@@ -582,6 +626,10 @@ pub enum DenyReason {
     NoSubjectAuthority,
     StaleFacts,
     InvalidAudience,
+    PublicReadNotAllowed,
+    LivePrincipalMismatch,
+    LiveDomainMismatch,
+    UnknownRole,
     CredentialPrincipalMismatch,
     CredentialAudienceMismatch,
     CredentialGrantMissing,
@@ -608,6 +656,11 @@ pub enum InitError {
 impl Authorizer {
     pub async fn new(config: AuthorizerConfig) -> Result<Self, InitError>;
     pub fn authorize(&self, request: &AuthzRequest) -> Decision;
+    pub fn authorize_with_roles(
+        &self,
+        request: &AuthzRequest,
+        resolved: &ResolvedRoles,
+    ) -> Decision;
     pub fn facts_revision(&self) -> FactsRevision;
     pub fn role_capabilities(&self, role: &RoleId) -> Option<&BTreeSet<Capability>>;
 }
@@ -845,6 +898,15 @@ Permanent pure tests cover:
 - administrator role has no wildcard capability and no private-data bypass;
 - malformed receiving or credential audiences deny in both principal and
   public-read modes;
+- a live role allows a registered capability with no snapshot assignment and a
+  mismatched snapshot revision;
+- live roles bind to the full principal and domain, reject unknown roles for
+  the whole request, and do not fall back to or union snapshot assignments;
+- removing a live admin role denies the next request without rebuilding;
+- live PublicRead is rejected and a role-like principal id does not self-
+  authorize;
+- live-path audience, cross-domain, exact-id, multi-domain, empty credential,
+  and empty server restrictions still deny;
 - unknown role/domain/resource/action and engine error deny;
 - duplicate configured domains, duplicate roles, unknown references, invalid
   public-read grants, and hierarchy cycles fail initialization.
@@ -858,11 +920,13 @@ The fixed gates are `cargo fmt --all -- --check`,
 These are not implementation details and must be resolved before the relevant
 consumer migration, not guessed in code.
 
-1. **Dynamic-facts architecture.** Some consumers cannot supply a current
-   revision cheaply at admission. Decide whether they accept a revisioned
-   snapshot boundary, keep live facts in the consumer, or need a future
-   live-facts API. The core does not pretend snapshot mode is a drop-in for
-   Context69 group membership or Stock project membership.
+1. **Dynamic-facts consumer integration.** The core now provides a trusted
+   live-resolved role path, so consumers with current facts do not need a
+   revisioned snapshot for authority. Remaining work is per-consumer adapter
+   integration and admission ownership: resolve roles from verified
+   introspection/SQL, never from client claims or an old snapshot. The core
+   still does not provide a revision database or cross-process invalidation,
+   and snapshot mode is not a drop-in for live membership by itself.
 2. **Delegation boundary.** Confirm that member-edit permission never implies
    the right to grant owner or higher authority. The target rule is stricter
    than Context69's current behavior.
