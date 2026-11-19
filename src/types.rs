@@ -151,6 +151,14 @@ pub struct ResourceRef {
     pub domain: DomainId,
 }
 
+/// Trusted current subject facts supplied by the caller for one request.
+///
+/// The caller is responsible for the provenance of every field: `principal`
+/// and `domain` are the exact target of the current lookup, and the domain
+/// existence plus the effective (including inherited) role set must come from
+/// authoritative current data, never from client claims or an old snapshot.
+/// `Authorizer::authorize_with_resolved_domain` trusts that provenance to
+/// admit a syntactically valid domain that is not registered in the authorizer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRoles {
     pub principal: PrincipalRef,
@@ -179,6 +187,7 @@ pub enum DenyReason {
     NoSubjectAuthority,
     StaleFacts,
     InvalidAudience,
+    InvalidDomain,
     PublicReadNotAllowed,
     LivePrincipalMismatch,
     LiveDomainMismatch,

@@ -27,8 +27,13 @@ database, or policy administration UI.
   stale assignment snapshots. It binds those roles to the full principal and
   exact request domain and still applies audience, credential, and server
   restrictions.
-- Unknown domains, resources, actions, stale facts, and engine errors deny.
-  Malformed service audiences and credential audience mismatches deny.
+- `Authorizer::authorize_with_resolved_domain` additionally admits a
+  syntactically valid domain that is not registered in the authorizer. The
+  caller must have established that the domain currently exists and must
+  supply its effective roles; syntactic validity alone grants nothing.
+- Unknown domains deny snapshot and registered live decisions; resources,
+  actions, stale facts, and engine errors deny. Malformed service audiences and
+  credential audience mismatches deny.
 - Row-level SQL visibility, leases, approvals, quotas, and IP rules remain
   application responsibilities.
 
@@ -44,7 +49,10 @@ For live-fact consumers, `authorize_with_roles` takes a caller-resolved
 roles through the same Casbin capabilities without mutating or rebuilding the
 engine, never falls back to snapshot assignments, and leaves credential and
 server attenuation mandatory. The caller owns live freshness; the core adds no
-revision database or invalidation service.
+revision database or invalidation service. When the domain itself is dynamic,
+`authorize_with_resolved_domain` applies the same checks but also accepts a
+syntactically valid unregistered domain, on the caller's authority that the
+target domain exists and the supplied roles are its current effective roles.
 
 ## Usage
 
@@ -103,8 +111,9 @@ async fn example() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Runnable examples are in [`examples/`](examples): a minimal service principal,
-a domain member inheriting a parent assignment, and a live-resolved-role
-decision that changes on the next request without rebuilding the engine.
+a domain member inheriting a parent assignment, a live-resolved-role decision
+that changes on the next request without rebuilding the engine, and a
+fresh-dynamic-domain decision using one engine.
 
 ## Documentation
 

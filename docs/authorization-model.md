@@ -1,11 +1,11 @@
 # Authorization model
 
-Status: implemented core contract, revised after parent review of record 5618
-and then implemented for P1. Current consumer behavior is recorded in
+Status: implemented core contract through P3, revised after parent review of
+record 5618 and extended for trusted live and dynamic-domain decisions. Current
+consumer behavior is recorded in
 [`consumer-mapping.md`](consumer-mapping.md); this document specifies the
-contract the `cloudiful-authz` crate implements. Consumer adapter integration,
-especially dynamic-facts freshness, remains unresolved and is not provided by
-the core.
+contract the `cloudiful-authz` crate implements. Consumer adapter integration
+and the provenance of caller-supplied live facts remain outside the core.
 
 ## 1. Scope and non-goals
 
@@ -151,19 +151,25 @@ Grant matching is a further restriction on an already registered capability.
 
 The decision is allow only when every applicable step passes.
 
-1. Check the facts revision against the authorizer snapshot; a mismatch denies
-   `StaleFacts` before any authority decision.
+1. For the snapshot entrypoint, check the facts revision against the
+   authorizer snapshot; a mismatch denies `StaleFacts` before any authority
+   decision. Both live entrypoints intentionally skip this comparison.
 2. Validate the receiving `ServiceId` and, when a credential is present, the
    credential `ServiceId`. Empty, control-bearing, or wildcard audience values
    deny `InvalidAudience` in both principal and public-read paths.
-3. Validate the request domain, resource kind, and action against the
-   registered schema.
+3. Validate the request domain, resource kind, and action. The snapshot and
+   `authorize_with_roles` entrypoints require a registered domain; the
+   dynamic-domain entrypoint instead requires syntactically valid request,
+   resolved, and resource domains and denies `InvalidDomain` otherwise.
 4. Require `resource.domain == request.domain`; otherwise deny
    `CrossDomainResource`.
 5. Determine subject authority:
-   - principal: ask Casbin whether the principal has a role in the request
-     domain whose registered capability set contains
+   - snapshot principal: ask Casbin whether the principal has a role in the
+     request domain whose registered capability set contains
      `(resource.kind, action)`;
+   - live principal: bind the resolved roles to the request principal and
+     domain, reject unknown roles, then check those roles against the same
+     registered capability policies;
    - public-read: require an exact registered public-read grant for the
      request domain, resource kind, optional exact id, and action. Public-read
      has no role inheritance and no anonymous role.
@@ -180,9 +186,10 @@ The decision is allow only when every applicable step passes.
    to allow.
 
 The stable denial-reason precedence is stale facts, malformed audience,
-validation, cross-domain, subject authority, credential, server, engine error. Applications normally map
-every denial to their own forbidden response and may log the reason, but must
-not leak role or policy detail to the caller.
+validation, invalid dynamic domain, cross-domain, subject authority, credential,
+server, engine error. Applications normally map every denial to their own
+forbidden response and may log the reason, but must not leak role or policy
+detail to the caller.
 
 Public-read is a subject-authority branch inside this algorithm, not a bypass.
 A request on a public-read route still evaluates any present credential and
@@ -364,8 +371,9 @@ Some consumers, especially Context69 group membership and Stock project
 membership, currently read live facts per request. An immutable Casbin
 `Authorizer` is a snapshot of role schema and assignments. It cannot by itself
 promise that a request decision reflects a membership or admin change that
-happened after construction. P0 must not claim adapter viability for dynamic
-membership without a concrete refresh and admission design.
+happened after construction. The core therefore provides explicit live-fact
+entrypoints whose caller owns current-fact provenance; it does not claim that
+snapshot mode is a drop-in for dynamic membership.
 
 ### Two models compared
 
@@ -430,16 +438,30 @@ the snapshot API.
   principal subject only. `Subject::PublicRead` is rejected with
   `PublicReadNotAllowed`; public-read continues through the existing public
   authority branch without resolved role input.
+- `Authorizer::authorize_with_resolved_domain(&AuthzRequest, &ResolvedRoles)`
+  is the explicit dynamic-domain variant. It accepts a syntactically valid
+  domain that is not registered in the authorizer, but only on the caller's
+  trusted provenance that the target domain currently exists and that the
+  supplied roles are its effective current roles. The core cannot independently
+  prove domain existence or membership; syntactic validity and a matching
+  credential grant grant nothing by themselves.
 - The resolved principal and domain must equal the request principal and
   request domain. A mismatch denies with `LivePrincipalMismatch` or
   `LiveDomainMismatch`. Unknown roles deny the entire request with
   `UnknownRole`; empty roles deny authority with `NoSubjectAuthority`.
-- The live entrypoint intentionally skips assignment-snapshot revision
-  equality because authority is supplied live. It never falls back to the
-  snapshot assignments, never unions live roles with snapshot roles, and never
-  reads `g` rows for subject authority.
-- Static role schema and registered domains still apply. A new or unknown
-  domain denies until the policy lifecycle registers it.
+- On the dynamic-domain path, request, resolved, and resource domains are
+  syntactically validated for empty, control-bearing, or exact-wildcard values;
+  malformed values deny `InvalidDomain`. A resource in another valid domain
+  still denies `CrossDomainResource`.
+- The live entrypoints intentionally skip assignment-snapshot revision
+  equality because authority is supplied live. They never fall back to the
+  snapshot assignments, never union live roles with snapshot roles, and never
+  read `g` rows for subject authority. A dynamic domain never inherits static
+  `g` assignments; the caller must supply the effective inherited roles.
+- `authorize_with_roles` keeps registered-domain admission: a new or unknown
+  domain denies until the policy lifecycle registers it. Only
+  `authorize_with_resolved_domain` admits an unregistered domain, and it does
+  not mutate the domain registry or expand hierarchy.
 - Live roles are evaluated against the same Casbin role policies through an
   explicit role-subject evaluation path in the fixed model. The encoded role
   identity is used directly; no `g` row is inserted or mutated, no enforcer is
@@ -626,6 +648,7 @@ pub enum DenyReason {
     NoSubjectAuthority,
     StaleFacts,
     InvalidAudience,
+    InvalidDomain,
     PublicReadNotAllowed,
     LivePrincipalMismatch,
     LiveDomainMismatch,
@@ -657,6 +680,11 @@ impl Authorizer {
     pub async fn new(config: AuthorizerConfig) -> Result<Self, InitError>;
     pub fn authorize(&self, request: &AuthzRequest) -> Decision;
     pub fn authorize_with_roles(
+        &self,
+        request: &AuthzRequest,
+        resolved: &ResolvedRoles,
+    ) -> Decision;
+    pub fn authorize_with_resolved_domain(
         &self,
         request: &AuthzRequest,
         resolved: &ResolvedRoles,
@@ -907,26 +935,37 @@ Permanent pure tests cover:
   authorize;
 - live-path audience, cross-domain, exact-id, multi-domain, empty credential,
   and empty server restrictions still deny;
+- an authorizer with only a service domain allows two independently trusted
+  group domains through the dynamic-domain entrypoint, while both old APIs
+  deny those requests `UnknownDomain`;
+- dynamic facts bind to the full principal and exact request domain, a
+  malformed or mismatched domain denies `InvalidDomain`/`LiveDomainMismatch`,
+  and dynamic domains do not inherit static `g` assignments;
+- dynamic PublicRead, empty, and unknown roles deny; exact group grants do not
+  expand to a child or sibling, scoped tuples remain non-Cartesian, and exact
+  object, audience, resource, action, and resource-id checks are preserved;
 - unknown role/domain/resource/action and engine error deny;
 - duplicate configured domains, duplicate roles, unknown references, invalid
   public-read grants, and hierarchy cycles fail initialization.
 
 The fixed gates are `cargo fmt --all -- --check`,
 `cargo check --all-targets --locked`, `cargo test --locked`,
-`cargo clippy --all-targets --locked`, and `git diff --check`.
+`cargo clippy --all-targets --locked`, the runnable examples, and
+`git diff --check`.
 
 ## 17. Open decisions and blockers
 
 These are not implementation details and must be resolved before the relevant
 consumer migration, not guessed in code.
 
-1. **Dynamic-facts consumer integration.** The core now provides a trusted
-   live-resolved role path, so consumers with current facts do not need a
-   revisioned snapshot for authority. Remaining work is per-consumer adapter
-   integration and admission ownership: resolve roles from verified
-   introspection/SQL, never from client claims or an old snapshot. The core
-   still does not provide a revision database or cross-process invalidation,
-   and snapshot mode is not a drop-in for live membership by itself.
+1. **Dynamic-facts consumer integration.** The core now provides trusted
+   live-resolved role and dynamic-domain entrypoints, so consumers with current
+   facts do not need a revisioned snapshot for authority. Remaining work is
+   per-consumer adapter integration and admission ownership: resolve the target
+   domain's existence and roles from verified introspection/SQL, never from
+   client claims or an old snapshot. The core still does not provide a revision
+   database, cross-process invalidation, or independent proof of domain
+   existence, and snapshot mode is not a drop-in for live membership by itself.
 2. **Delegation boundary.** Confirm that member-edit permission never implies
    the right to grant owner or higher authority. The target rule is stricter
    than Context69's current behavior.

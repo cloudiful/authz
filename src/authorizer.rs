@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use casbin::{CoreApi, DefaultModel, EnforceContext, Enforcer, MemoryAdapter, MgmtApi};
 
-use crate::encoding::{encode_principal, encode_role, validate_identifier, validate_service_id};
+use crate::encoding::{
+    encode_principal, encode_role, validate_identifier, validate_resolved_domain,
+    validate_service_id,
+};
 use crate::error::InitError;
 use crate::types::{
     Action, Attenuation, AuthorizerConfig, AuthzRequest, Capability, Decision, DenyReason,
@@ -25,6 +28,12 @@ e = some(where (p.eft == allow))
 m = g(r.sub, p.sub, r.dom) && r.obj == p.obj && r.act == p.act
 m2 = r2.sub == p.sub && r2.obj == p.obj && r2.act == p.act
 "#;
+
+#[derive(Clone, Copy)]
+enum DomainAdmission {
+    Registered,
+    Resolved,
+}
 
 #[derive(Clone)]
 pub struct Authorizer {
@@ -139,7 +148,7 @@ impl Authorizer {
         if request.facts_revision != self.facts_revision {
             return Decision::Deny(DenyReason::StaleFacts);
         }
-        if let Some(reason) = self.common_denial(request) {
+        if let Some(reason) = self.common_denial(request, DomainAdmission::Registered) {
             return Decision::Deny(reason);
         }
         let subject_allowed = match self.snapshot_authority(request) {
@@ -154,24 +163,13 @@ impl Authorizer {
         request: &AuthzRequest,
         resolved: &ResolvedRoles,
     ) -> Decision {
-        if let Some(reason) = self.common_denial(request) {
+        if let Some(reason) = self.common_denial(request, DomainAdmission::Registered) {
             return Decision::Deny(reason);
         }
-        let Subject::Principal(principal) = &request.subject else {
-            return Decision::Deny(DenyReason::PublicReadNotAllowed);
-        };
-        if validate_identifier(&resolved.principal.id.0).is_err()
-            || &resolved.principal != principal
+        if let Some(reason) =
+            self.live_binding_denial(request, resolved, DomainAdmission::Registered)
         {
-            return Decision::Deny(DenyReason::LivePrincipalMismatch);
-        }
-        if validate_identifier(&resolved.domain.0).is_err() || resolved.domain != request.domain {
-            return Decision::Deny(DenyReason::LiveDomainMismatch);
-        }
-        for role in &resolved.roles {
-            if !self.roles.contains_key(role) {
-                return Decision::Deny(DenyReason::UnknownRole);
-            }
+            return Decision::Deny(reason);
         }
         let subject_allowed = match self.live_authority(request, &resolved.roles) {
             Ok(allowed) => allowed,
@@ -180,7 +178,79 @@ impl Authorizer {
         self.finish(request, subject_allowed)
     }
 
-    fn common_denial(&self, request: &AuthzRequest) -> Option<DenyReason> {
+    /// Authorizes a principal using trusted current roles for a dynamically
+    /// resolved domain.
+    ///
+    /// Unlike [`Self::authorize_with_roles`], the request domain does not have
+    /// to be registered in the authorizer. The caller owns the provenance of
+    /// both the domain and the roles: it must have authoritatively established
+    /// that the target domain currently exists and must supply its effective
+    /// roles. This method cannot prove domain existence or membership itself;
+    /// a syntactically valid domain alone grants nothing, and the role schema,
+    /// resource/action universe, audience, credential, and server checks still
+    /// run. No dynamic domain inherits static `g` assignments, the registry is
+    /// not mutated, and no per-request engine is created.
+    pub fn authorize_with_resolved_domain(
+        &self,
+        request: &AuthzRequest,
+        resolved: &ResolvedRoles,
+    ) -> Decision {
+        if let Some(reason) = self.common_denial(request, DomainAdmission::Resolved) {
+            return Decision::Deny(reason);
+        }
+        if let Some(reason) = self.live_binding_denial(request, resolved, DomainAdmission::Resolved)
+        {
+            return Decision::Deny(reason);
+        }
+        let subject_allowed = match self.live_authority(request, &resolved.roles) {
+            Ok(allowed) => allowed,
+            Err(reason) => return Decision::Deny(reason),
+        };
+        self.finish(request, subject_allowed)
+    }
+
+    fn live_binding_denial(
+        &self,
+        request: &AuthzRequest,
+        resolved: &ResolvedRoles,
+        admission: DomainAdmission,
+    ) -> Option<DenyReason> {
+        let Subject::Principal(principal) = &request.subject else {
+            return Some(DenyReason::PublicReadNotAllowed);
+        };
+        if validate_identifier(&resolved.principal.id.0).is_err()
+            || &resolved.principal != principal
+        {
+            return Some(DenyReason::LivePrincipalMismatch);
+        }
+        match admission {
+            DomainAdmission::Registered => {
+                if validate_identifier(&resolved.domain.0).is_err() {
+                    return Some(DenyReason::LiveDomainMismatch);
+                }
+            }
+            DomainAdmission::Resolved => {
+                if validate_resolved_domain(&resolved.domain.0).is_err() {
+                    return Some(DenyReason::InvalidDomain);
+                }
+            }
+        }
+        if resolved.domain != request.domain {
+            return Some(DenyReason::LiveDomainMismatch);
+        }
+        for role in &resolved.roles {
+            if !self.roles.contains_key(role) {
+                return Some(DenyReason::UnknownRole);
+            }
+        }
+        None
+    }
+
+    fn common_denial(
+        &self,
+        request: &AuthzRequest,
+        admission: DomainAdmission,
+    ) -> Option<DenyReason> {
         if validate_service_id(&request.audience.0).is_err() {
             return Some(DenyReason::InvalidAudience);
         }
@@ -189,8 +259,19 @@ impl Authorizer {
         {
             return Some(DenyReason::InvalidAudience);
         }
-        if !self.domains.contains(&request.domain) {
-            return Some(DenyReason::UnknownDomain);
+        match admission {
+            DomainAdmission::Registered => {
+                if !self.domains.contains(&request.domain) {
+                    return Some(DenyReason::UnknownDomain);
+                }
+            }
+            DomainAdmission::Resolved => {
+                if validate_resolved_domain(&request.domain.0).is_err()
+                    || validate_resolved_domain(&request.resource.domain.0).is_err()
+                {
+                    return Some(DenyReason::InvalidDomain);
+                }
+            }
         }
         if !self.resources.contains(&request.resource.kind) {
             return Some(DenyReason::UnknownResource);
