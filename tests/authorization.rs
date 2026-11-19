@@ -108,6 +108,30 @@ fn config() -> AuthorizerConfig {
     }
 }
 
+fn dynamic_config() -> AuthorizerConfig {
+    AuthorizerConfig {
+        facts_revision: FactsRevision(11),
+        domains: vec![domain("service")],
+        roles: vec![
+            role("viewer", &[("content", "read"), ("content", "list")]),
+            role(
+                "maintainer",
+                &[
+                    ("content", "read"),
+                    ("content", "list"),
+                    ("content", "write"),
+                ],
+            ),
+            role("owner", &[("membership", "grant")]),
+            role("admin", &[("admin", "read")]),
+        ],
+        assignments: Vec::new(),
+        global_assignments: Vec::new(),
+        hierarchy: DomainHierarchy::default(),
+        public_read: BTreeSet::new(),
+    }
+}
+
 fn make_request(
     subject: Subject,
     domain_value: &str,
@@ -885,6 +909,344 @@ async fn live_path_keeps_empty_and_multi_domain_credential_restrictions() {
     assert_eq!(
         authorizer.authorize_with_roles(&request, &facts),
         Decision::Deny(DenyReason::CredentialPrincipalMismatch)
+    );
+}
+
+#[tokio::test]
+async fn resolved_domain_allows_current_group_domains_and_old_apis_deny_unknown_domain() {
+    let authorizer = authorizer_with(dynamic_config()).await;
+
+    for group in ["group:alpha", "group:beta"] {
+        let request = human_request("42", group, "content", "read");
+        let facts = resolved(principal(PrincipalKind::Human, "42"), group, &["viewer"]);
+
+        assert!(
+            authorizer
+                .authorize_with_resolved_domain(&request, &facts)
+                .is_allowed()
+        );
+
+        let mut current_revision = request.clone();
+        current_revision.facts_revision = FactsRevision(11);
+        assert_eq!(
+            authorizer.authorize(&current_revision),
+            Decision::Deny(DenyReason::UnknownDomain)
+        );
+        assert_eq!(
+            authorizer.authorize_with_roles(&current_revision, &facts),
+            Decision::Deny(DenyReason::UnknownDomain)
+        );
+
+        let mut live_revision = request;
+        live_revision.facts_revision = FactsRevision(999);
+        assert!(
+            authorizer
+                .authorize_with_resolved_domain(&live_revision, &facts)
+                .is_allowed()
+        );
+    }
+}
+
+#[tokio::test]
+async fn resolved_domain_binds_the_full_principal_and_request_domain() {
+    let authorizer = authorizer_with(dynamic_config()).await;
+    let request = human_request("42", "group:alpha", "content", "read");
+
+    let wrong_id = resolved(
+        principal(PrincipalKind::Human, "43"),
+        "group:alpha",
+        &["viewer"],
+    );
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&request, &wrong_id),
+        Decision::Deny(DenyReason::LivePrincipalMismatch)
+    );
+
+    let wrong_kind = resolved(
+        principal(PrincipalKind::Service, "42"),
+        "group:alpha",
+        &["viewer"],
+    );
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&request, &wrong_kind),
+        Decision::Deny(DenyReason::LivePrincipalMismatch)
+    );
+
+    let group_a_facts = resolved(
+        principal(PrincipalKind::Human, "42"),
+        "group:alpha",
+        &["viewer"],
+    );
+    let group_b_request = human_request("42", "group:beta", "content", "read");
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&group_b_request, &group_a_facts),
+        Decision::Deny(DenyReason::LiveDomainMismatch)
+    );
+}
+
+#[tokio::test]
+async fn resolved_domain_rejects_malformed_domains_and_cross_domain_resources() {
+    let authorizer = authorizer_with(dynamic_config()).await;
+    let facts = resolved(
+        principal(PrincipalKind::Human, "42"),
+        "group:alpha",
+        &["viewer"],
+    );
+
+    for malformed in ["", "group:\n", "*"] {
+        let mut request = human_request("42", malformed, "content", "read");
+        assert_eq!(
+            authorizer.authorize_with_resolved_domain(&request, &facts),
+            Decision::Deny(DenyReason::InvalidDomain)
+        );
+        request.domain = domain("group:alpha");
+        request.resource.domain = domain(malformed);
+        let malformed_resource_domain = resolved(
+            principal(PrincipalKind::Human, "42"),
+            "group:alpha",
+            &["viewer"],
+        );
+        assert_eq!(
+            authorizer.authorize_with_resolved_domain(&request, &malformed_resource_domain),
+            Decision::Deny(DenyReason::InvalidDomain)
+        );
+    }
+
+    let request = human_request("42", "group:alpha", "content", "read");
+    let malformed_facts = resolved(principal(PrincipalKind::Human, "42"), "", &["viewer"]);
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&request, &malformed_facts),
+        Decision::Deny(DenyReason::InvalidDomain)
+    );
+
+    let mut cross_domain = human_request("42", "group:alpha", "content", "read");
+    cross_domain.resource.domain = domain("group:beta");
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&cross_domain, &facts),
+        Decision::Deny(DenyReason::CrossDomainResource)
+    );
+}
+
+#[tokio::test]
+async fn resolved_domain_rejects_public_empty_unknown_and_snapshot_only_authority() {
+    let authorizer = authorizer_with(dynamic_config()).await;
+    let public = make_request(Subject::PublicRead, "group:alpha", "content", "read", 11);
+    let facts = resolved(
+        principal(PrincipalKind::Human, "42"),
+        "group:alpha",
+        &["viewer"],
+    );
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&public, &facts),
+        Decision::Deny(DenyReason::PublicReadNotAllowed)
+    );
+
+    let request = human_request("42", "group:alpha", "content", "read");
+    let unknown = resolved(
+        principal(PrincipalKind::Human, "42"),
+        "group:alpha",
+        &["viewer", "missing"],
+    );
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&request, &unknown),
+        Decision::Deny(DenyReason::UnknownRole)
+    );
+
+    let empty = resolved(principal(PrincipalKind::Human, "42"), "group:alpha", &[]);
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&request, &empty),
+        Decision::Deny(DenyReason::NoSubjectAuthority)
+    );
+
+    let snapshot = authorizer_with(config()).await;
+    let registered = human_request("42", "tenant:a", "content", "write");
+    assert!(snapshot.authorize(&registered).is_allowed());
+    let no_live_roles = resolved(principal(PrincipalKind::Human, "42"), "tenant:a", &[]);
+    assert_eq!(
+        snapshot.authorize_with_resolved_domain(&registered, &no_live_roles),
+        Decision::Deny(DenyReason::NoSubjectAuthority)
+    );
+}
+
+#[tokio::test]
+async fn resolved_domain_exact_group_grants_do_not_expand_to_children_or_siblings() {
+    let authorizer = authorizer_with(dynamic_config()).await;
+
+    let mut request = human_request("42", "group:alpha", "content", "read");
+    request.credential = Some(CredentialContext {
+        principal: principal(PrincipalKind::Human, "42"),
+        audience: ServiceId::new("svc"),
+        grants: grants([grant("group:alpha", "content", None, "read")]),
+    });
+    let alpha_facts = resolved(
+        principal(PrincipalKind::Human, "42"),
+        "group:alpha",
+        &["viewer"],
+    );
+    assert!(
+        authorizer
+            .authorize_with_resolved_domain(&request, &alpha_facts)
+            .is_allowed()
+    );
+
+    for other in ["group:alpha/child", "group:beta"] {
+        let mut other_request = human_request("42", other, "content", "read");
+        other_request.credential = request.credential.clone();
+        let other_facts = resolved(principal(PrincipalKind::Human, "42"), other, &["viewer"]);
+        assert_eq!(
+            authorizer.authorize_with_resolved_domain(&other_request, &other_facts),
+            Decision::Deny(DenyReason::CredentialGrantMissing)
+        );
+    }
+}
+
+#[tokio::test]
+async fn resolved_domain_preserves_empty_credential_and_server_ceilings() {
+    let authorizer = authorizer_with(dynamic_config()).await;
+    let request = human_request("42", "group:alpha", "content", "read");
+    let facts = resolved(
+        principal(PrincipalKind::Human, "42"),
+        "group:alpha",
+        &["viewer"],
+    );
+
+    assert!(
+        authorizer
+            .authorize_with_resolved_domain(&request, &facts)
+            .is_allowed()
+    );
+
+    let mut empty_credential = request.clone();
+    empty_credential.credential = Some(CredentialContext {
+        principal: principal(PrincipalKind::Human, "42"),
+        audience: ServiceId::new("svc"),
+        grants: grants([]),
+    });
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&empty_credential, &facts),
+        Decision::Deny(DenyReason::CredentialGrantMissing)
+    );
+
+    let mut empty_server = request.clone();
+    empty_server.server = Some(ServerContext { grants: grants([]) });
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&empty_server, &facts),
+        Decision::Deny(DenyReason::ServerGrantMissing)
+    );
+
+    let mut wrong_credential_principal = request.clone();
+    wrong_credential_principal.credential = Some(CredentialContext {
+        principal: principal(PrincipalKind::Human, "43"),
+        audience: ServiceId::new("svc"),
+        grants: Attenuation::Unrestricted,
+    });
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&wrong_credential_principal, &facts),
+        Decision::Deny(DenyReason::CredentialPrincipalMismatch)
+    );
+
+    let mut wrong_credential_audience = request;
+    wrong_credential_audience.credential = Some(CredentialContext {
+        principal: principal(PrincipalKind::Human, "42"),
+        audience: ServiceId::new("other"),
+        grants: Attenuation::Unrestricted,
+    });
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&wrong_credential_audience, &facts),
+        Decision::Deny(DenyReason::CredentialAudienceMismatch)
+    );
+}
+
+#[tokio::test]
+async fn resolved_domain_preserves_scoped_tuple_and_exact_object_denials() {
+    let authorizer = authorizer_with(dynamic_config()).await;
+    let facts = resolved(
+        principal(PrincipalKind::Human, "42"),
+        "group:alpha",
+        &["maintainer"],
+    );
+
+    let mut request = human_request("42", "group:alpha", "content", "write");
+    request.credential = Some(CredentialContext {
+        principal: principal(PrincipalKind::Human, "42"),
+        audience: ServiceId::new("svc"),
+        grants: grants([
+            grant("group:alpha", "content", None, "read"),
+            grant("group:beta", "content", None, "write"),
+        ]),
+    });
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&request, &facts),
+        Decision::Deny(DenyReason::CredentialGrantMissing)
+    );
+
+    request.action = Action::new("read");
+    request.resource.id = Some(ResourceId::new("doc-2"));
+    request.credential = Some(CredentialContext {
+        principal: principal(PrincipalKind::Human, "42"),
+        audience: ServiceId::new("svc"),
+        grants: grants([grant("group:alpha", "content", Some("doc-1"), "read")]),
+    });
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&request, &facts),
+        Decision::Deny(DenyReason::CredentialGrantMissing)
+    );
+
+    request.resource.id = Some(ResourceId::new("doc-1"));
+    assert!(
+        authorizer
+            .authorize_with_resolved_domain(&request, &facts)
+            .is_allowed()
+    );
+}
+
+#[tokio::test]
+async fn resolved_domain_still_rejects_unknown_universe_and_malformed_audiences() {
+    let authorizer = authorizer_with(dynamic_config()).await;
+    let facts = resolved(
+        principal(PrincipalKind::Human, "42"),
+        "group:alpha",
+        &["viewer"],
+    );
+
+    let mut invalid_audience = human_request("42", "group:alpha", "content", "read");
+    invalid_audience.audience = ServiceId::new("");
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&invalid_audience, &facts),
+        Decision::Deny(DenyReason::InvalidAudience)
+    );
+
+    let mut invalid_credential_audience = human_request("42", "group:alpha", "content", "read");
+    invalid_credential_audience.credential = Some(CredentialContext {
+        principal: principal(PrincipalKind::Human, "42"),
+        audience: ServiceId::new("*"),
+        grants: Attenuation::Unrestricted,
+    });
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&invalid_credential_audience, &facts),
+        Decision::Deny(DenyReason::InvalidAudience)
+    );
+
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(
+            &human_request("42", "group:alpha", "unknown", "read"),
+            &facts
+        ),
+        Decision::Deny(DenyReason::UnknownResource)
+    );
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(
+            &human_request("42", "group:alpha", "content", "delete"),
+            &facts
+        ),
+        Decision::Deny(DenyReason::UnknownAction)
+    );
+
+    let mut invalid_resource_id = human_request("42", "group:alpha", "content", "read");
+    invalid_resource_id.resource.id = Some(ResourceId::new(""));
+    assert_eq!(
+        authorizer.authorize_with_resolved_domain(&invalid_resource_id, &facts),
+        Decision::Deny(DenyReason::UnknownResource)
     );
 }
 
