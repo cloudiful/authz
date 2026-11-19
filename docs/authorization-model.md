@@ -88,15 +88,26 @@ domain-scoped role assignment, never an application identity.
 
 A request contains:
 
-- subject: either a typed `(principal kind, principal id)` or the trusted
-  public-read mode;
-- request domain;
 - resource kind, optional exact resource id, and resource domain;
 - exact action;
 - the receiving service audience;
-- facts revision;
 - optional credential context;
 - optional server context.
+
+The subject identity, the decision domain, and the current roles are supplied
+separately as `Authority`:
+
+- `Snapshot { subject, domain, facts_revision }`: either a typed
+  `(principal kind, principal id)` or the trusted public-read mode, plus the
+  snapshot revision the consumer observed;
+- `Registered(&ResolvedRoles)`: trusted current principal-bound roles for a
+  registered domain;
+- `Resolved(&ResolvedRoles)`: trusted current principal-bound roles for a
+  syntactically valid domain that the caller has proven currently exists.
+
+A live `ResolvedRoles` carries the full principal, the exact domain, and the
+effective role set. It is never a free-floating role list, so its facts cannot be
+detached from their principal or domain.
 
 The credential context contains:
 
@@ -151,38 +162,38 @@ Grant matching is a further restriction on an already registered capability.
 
 The decision is allow only when every applicable step passes.
 
-1. For the snapshot entrypoint, check the facts revision against the
-   authorizer snapshot; a mismatch denies `StaleFacts` before any authority
-   decision. Both live entrypoints intentionally skip this comparison.
+1. For `Authority::Snapshot`, check the facts revision against the authorizer
+   snapshot; a mismatch denies `StaleFacts` before any authority decision.
+   `Registered` and `Resolved` intentionally skip this comparison because their
+   authority is supplied live.
 2. Validate the receiving `ServiceId` and, when a credential is present, the
    credential `ServiceId`. Empty, control-bearing, or wildcard audience values
    deny `InvalidAudience` in both principal and public-read paths.
-3. Validate the request domain, resource kind, and action. The snapshot and
-   `authorize_with_roles` entrypoints require a registered domain; the
-   dynamic-domain entrypoint instead requires syntactically valid request,
-   resolved, and resource domains and denies `InvalidDomain` otherwise.
-4. Require `resource.domain == request.domain`; otherwise deny
-   `CrossDomainResource`.
-5. Determine subject authority:
+3. Validate the authority domain, resource kind, and action. `Snapshot` and
+   `Registered` require a registered domain; `Resolved` instead requires
+   syntactically valid authority and resource domains and denies `InvalidDomain`
+   otherwise. The resource domain must equal the authority domain; otherwise
+   deny `CrossDomainResource`.
+4. Determine subject authority:
    - snapshot principal: ask Casbin whether the principal has a role in the
-     request domain whose registered capability set contains
+     authority domain whose registered capability set contains
      `(resource.kind, action)`;
-   - live principal: bind the resolved roles to the request principal and
-     domain, reject unknown roles, then check those roles against the same
-     registered capability policies;
+   - live principal: validate the bound principal identifier, reject unknown
+     roles, then check those roles against the same registered capability
+     policies;
    - public-read: require an exact registered public-read grant for the
-     request domain, resource kind, optional exact id, and action. Public-read
+     authority domain, resource kind, optional exact id, and action. Public-read
      has no role inheritance and no anonymous role.
-6. If a credential context is present:
+5. If a credential context is present:
    - for a principal subject, deny `CredentialPrincipalMismatch` unless the
-     credential's full `(kind, id)` equals the request principal;
+     credential's full `(kind, id)` equals the authority principal;
    - deny `CredentialAudienceMismatch` unless the credential audience equals
      the receiving service audience;
    - deny `CredentialGrantMissing` unless the credential attenuation admits the
      request.
-7. If a server context is present, deny `ServerGrantMissing` unless its
+6. If a server context is present, deny `ServerGrantMissing` unless its
    attenuation admits the request.
-8. Allow. Any internal engine error denies `EngineError`; it is never converted
+7. Allow. Any internal engine error denies `EngineError`; it is never converted
    to allow.
 
 The stable denial-reason precedence is stale facts, malformed audience,
@@ -222,7 +233,7 @@ m = g(r.sub, p.sub, r.dom) && r.obj == p.obj && r.act == p.act
 - `p(role_subject, resource_kind, action)` is one registered role capability.
 - `g(principal_subject, role_subject, domain)` is one effective role
   assignment.
-- `r.sub` is the encoded principal subject, `r.dom` is the request domain,
+- `r.sub` is the encoded principal subject, `r.dom` is the authority domain,
   `r.obj` is the resource kind, and `r.act` is the exact action.
 - Casbin's domain-role relation performs the membership decision. The matcher
   does not contain a handwritten rank comparator, role switch, or business-name
@@ -317,7 +328,7 @@ A credential is evidence of authentication and an attenuation layer. It is
 never a role assignment.
 
 - The credential's bound principal uses the full `(kind, id)` pair and must
-  equal the request principal on the principal branch.
+  equal the authority principal on the principal branch.
 - The credential audience is compared with the receiving service audience and
   is separate from the permission domain. Matching domain strings cannot
   substitute for audience validation. The consumer must take the audience from
@@ -388,10 +399,12 @@ The core adds a facts revision to the API and rejects stale admission:
 
 - `AuthorizerConfig` carries the trusted `FactsRevision` used to build the
   snapshot.
-- `AuthzRequest` carries the revision the consumer observed from the same
-  trusted source that produced the assignments.
-- `Authorizer::authorize` denies `StaleFacts` when the request revision differs
-  from the snapshot revision.
+- `Authority::Snapshot { domain, facts_revision, .. }` carries the revision the
+  consumer observed from the same trusted source that produced the assignments.
+  The live `Authority::Registered` and `Authority::Resolved` variants carry no
+  assignment revision because their roles are supplied live.
+- `Authorizer::authorize` denies `StaleFacts` when the `Authority::Snapshot`
+  revision differs from the snapshot revision.
 - `Authorizer::facts_revision()` exposes the snapshot revision.
 
 The implemented `Authorizer` stores its snapshot revision and applies this check
@@ -410,9 +423,9 @@ On a membership, role-schema, or hierarchy change:
 2. the process builds a new immutable `Authorizer` from current trusted facts
    (not per request);
 3. the process atomically replaces the old authorizer;
-4. an old-snapshot request with a new revision is denied `StaleFacts` until the
-   replacement is installed, and a request carrying an old revision after the
-   swap is also denied; the consumer retries after refresh.
+4. a snapshot authority with a new revision is denied `StaleFacts` until the
+   replacement is installed, and a snapshot authority carrying an old revision
+   after the swap is also denied; the consumer retries after refresh.
 
 The core does not implement a distributed invalidation bus. Each process
 refreshes independently. A deployment that cannot observe a shared revision must use live
@@ -427,41 +440,39 @@ minimal API for snapshot decisions.
 
 ### Trusted live-resolved roles
 
-The core also exposes a live-fact entrypoint for consumers that already resolve
+The core also exposes live-fact authority for consumers that already resolve
 current roles from trusted introspection or SQL. It does not tighten or replace
-the snapshot API.
+the snapshot authority.
 
 - `ResolvedRoles` carries the full `PrincipalRef`, the exact `DomainId`, and the
   `BTreeSet<RoleId>` resolved for that principal in that domain. This is
   trusted server-resolved data, never a client token role claim.
-- `Authorizer::authorize_with_roles(&AuthzRequest, &ResolvedRoles)` accepts the
-  principal subject only. `Subject::PublicRead` is rejected with
-  `PublicReadNotAllowed`; public-read continues through the existing public
-  authority branch without resolved role input.
-- `Authorizer::authorize_with_resolved_domain(&AuthzRequest, &ResolvedRoles)`
-  is the explicit dynamic-domain variant. It accepts a syntactically valid
-  domain that is not registered in the authorizer, but only on the caller's
-  trusted provenance that the target domain currently exists and that the
-  supplied roles are its effective current roles. The core cannot independently
-  prove domain existence or membership; syntactic validity and a matching
-  credential grant grant nothing by themselves.
-- The resolved principal and domain must equal the request principal and
-  request domain. A mismatch denies with `LivePrincipalMismatch` or
-  `LiveDomainMismatch`. Unknown roles deny the entire request with
-  `UnknownRole`; empty roles deny authority with `NoSubjectAuthority`.
-- On the dynamic-domain path, request, resolved, and resource domains are
-  syntactically validated for empty, control-bearing, or exact-wildcard values;
-  malformed values deny `InvalidDomain`. A resource in another valid domain
-  still denies `CrossDomainResource`.
-- The live entrypoints intentionally skip assignment-snapshot revision
-  equality because authority is supplied live. They never fall back to the
-  snapshot assignments, never union live roles with snapshot roles, and never
-  read `g` rows for subject authority. A dynamic domain never inherits static
-  `g` assignments; the caller must supply the effective inherited roles.
-- `authorize_with_roles` keeps registered-domain admission: a new or unknown
-  domain denies until the policy lifecycle registers it. Only
-  `authorize_with_resolved_domain` admits an unregistered domain, and it does
-  not mutate the domain registry or expand hierarchy.
+- `Authority::Registered(&ResolvedRoles)` accepts the principal-bound roles only
+  for a registered domain. A new or unknown domain denies `UnknownDomain` until
+  the policy lifecycle registers it.
+- `Authority::Resolved(&ResolvedRoles)` is the explicit dynamic-domain variant.
+  It accepts a syntactically valid domain that is not registered in the
+  authorizer, but only on the caller's trusted provenance that the target domain
+  currently exists and that the supplied roles are its effective current roles.
+  The core cannot independently prove domain existence or membership; syntactic
+  validity and a matching credential grant grant nothing by themselves.
+- Because live authority is `ResolvedRoles` rather than a `Subject`, a live
+  public-read request is unrepresentable: public-read continues through
+  `Authority::Snapshot` with `Subject::PublicRead` and no resolved role input.
+- The decision domain is the authority domain, and the resource domain must
+  equal it; otherwise the request denies `CrossDomainResource`. Malformed live
+  principal identifiers deny `NoSubjectAuthority`. Unknown roles deny the entire
+  request with `UnknownRole`; empty roles deny authority with
+  `NoSubjectAuthority`.
+- On the dynamic-domain path, authority and resource domains are syntactically
+  validated for empty, control-bearing, or exact-wildcard values; malformed
+  values deny `InvalidDomain`.
+- The live variants intentionally skip assignment-snapshot revision equality
+  because authority is supplied live. They never fall back to the snapshot
+  assignments, never union live roles with snapshot roles, and never read `g`
+  rows for subject authority. A dynamic domain never inherits static `g`
+  assignments; the caller must supply the effective inherited roles.
+- `Authority::Resolved` does not mutate the domain registry or expand hierarchy.
 - Live roles are evaluated against the same Casbin role policies through an
   explicit role-subject evaluation path in the fixed model. The encoded role
   identity is used directly; no `g` row is inserted or mutated, no enforcer is
@@ -476,8 +487,8 @@ the snapshot API.
   assignment snapshot. The core adds no revision database, cache, TTL, or
   invalidation mechanism.
 
-The snapshot `authorize` entrypoint keeps its existing `FactsRevision` equality
-check and real Casbin `g` domain semantics unchanged.
+`Authority::Snapshot` keeps its `FactsRevision` equality check and real Casbin
+`g` domain semantics unchanged.
 
 ## 12. Lists, queries, and row visibility
 
@@ -512,10 +523,10 @@ identifiers, invalid public-read grants, and Casbin model or adapter failure.
 Repeated effective assignments are deduplicated; configured domains and roles
 are not.
 
-`authorize(&self, request)` is synchronous, allocation-light, and safe to call
-concurrently. There is no lazy `OnceCell`, no `block_on`, no spawned
-initialization thread, no per-request engine construction, and no fallback to
-allow on initialization or enforcement failure.
+`Authorizer::authorize(&self, request, authority)` is synchronous,
+allocation-light, and safe to call concurrently. There is no lazy `OnceCell`, no
+`block_on`, no spawned initialization thread, no per-request engine construction,
+and no fallback to allow on initialization or enforcement failure.
 
 The consumer owns the authorizer's lifetime. It stores an immutable
 `Arc<Authorizer>` and replaces it at the revision refresh boundary, or builds it
@@ -548,6 +559,13 @@ pub struct PrincipalRef {
     pub id: PrincipalId,
 }
 
+impl PrincipalRef {
+    pub fn new(kind: PrincipalKind, id: impl Into<PrincipalId>) -> Self;
+    pub fn human(id: impl Into<PrincipalId>) -> Self;
+    pub fn service(id: impl Into<PrincipalId>) -> Self;
+    pub fn application(id: impl Into<PrincipalId>) -> Self;
+}
+
 pub enum Subject {
     Principal(PrincipalRef),
     PublicRead,
@@ -558,6 +576,10 @@ pub struct Capability {
     pub action: Action,
 }
 
+impl Capability {
+    pub fn new(resource: impl Into<ResourceKind>, action: impl Into<Action>) -> Self;
+}
+
 pub struct Grant {
     pub domain: DomainId,
     pub resource: ResourceKind,
@@ -565,9 +587,24 @@ pub struct Grant {
     pub action: Action,
 }
 
+impl Grant {
+    pub fn new(
+        domain: impl Into<DomainId>,
+        resource: impl Into<ResourceKind>,
+        action: impl Into<Action>,
+    ) -> Self;
+    pub fn with_resource_id(self, id: impl Into<ResourceId>) -> Self;
+}
+
 pub enum Attenuation {
     Unrestricted,
     Grants(BTreeSet<Grant>),
+}
+
+impl Attenuation {
+    pub fn grants(entries: impl IntoIterator<Item = Grant>) -> Self;
+    pub fn deny_all() -> Self;
+    pub fn unrestricted() -> Self;
 }
 
 pub struct RoleSpec {
@@ -607,6 +644,14 @@ pub struct AuthorizerConfig {
     pub public_read: BTreeSet<PublicReadGrant>,
 }
 
+impl AuthorizerConfig {
+    pub fn new(
+        facts_revision: FactsRevision,
+        domains: impl IntoIterator<Item = impl Into<DomainId>>,
+        roles: impl IntoIterator<Item = RoleSpec>,
+    ) -> Self;
+}
+
 pub struct CredentialContext {
     pub principal: PrincipalRef,
     pub audience: ServiceId,
@@ -629,15 +674,30 @@ pub struct ResolvedRoles {
     pub roles: BTreeSet<RoleId>,
 }
 
+impl ResolvedRoles {
+    pub fn new(
+        principal: PrincipalRef,
+        domain: impl Into<DomainId>,
+        roles: impl IntoIterator<Item = impl Into<RoleId>>,
+    ) -> Self;
+}
+
 pub struct AuthzRequest {
-    pub subject: Subject,
-    pub domain: DomainId,
     pub resource: ResourceRef,
     pub action: Action,
     pub audience: ServiceId,
-    pub facts_revision: FactsRevision,
     pub credential: Option<CredentialContext>,
     pub server: Option<ServerContext>,
+}
+
+pub enum Authority<'a> {
+    Snapshot {
+        subject: Subject,
+        domain: DomainId,
+        facts_revision: FactsRevision,
+    },
+    Registered(&'a ResolvedRoles),
+    Resolved(&'a ResolvedRoles),
 }
 
 pub enum DenyReason {
@@ -649,9 +709,6 @@ pub enum DenyReason {
     StaleFacts,
     InvalidAudience,
     InvalidDomain,
-    PublicReadNotAllowed,
-    LivePrincipalMismatch,
-    LiveDomainMismatch,
     UnknownRole,
     CredentialPrincipalMismatch,
     CredentialAudienceMismatch,
@@ -678,21 +735,25 @@ pub enum InitError {
 
 impl Authorizer {
     pub async fn new(config: AuthorizerConfig) -> Result<Self, InitError>;
-    pub fn authorize(&self, request: &AuthzRequest) -> Decision;
-    pub fn authorize_with_roles(
-        &self,
-        request: &AuthzRequest,
-        resolved: &ResolvedRoles,
-    ) -> Decision;
-    pub fn authorize_with_resolved_domain(
-        &self,
-        request: &AuthzRequest,
-        resolved: &ResolvedRoles,
-    ) -> Decision;
+    pub fn authorize(&self, request: &AuthzRequest, authority: Authority<'_>) -> Decision;
     pub fn facts_revision(&self) -> FactsRevision;
     pub fn role_capabilities(&self, role: &RoleId) -> Option<&BTreeSet<Capability>>;
 }
 ```
+
+The previous public `authorize_with_roles` and
+`authorize_with_resolved_domain` methods are removed; the authority choice is
+now explicit in the call. `DenyReason` no longer has `PublicReadNotAllowed` or
+`LiveDomainMismatch`: live public-read is unrepresentable because live authority
+is principal bound, and there is no separate request domain to mismatch the
+authority domain; an authority/resource domain difference denies
+`CrossDomainResource`. `LivePrincipalMismatch` is also removed because the
+independent request-principal versus fact-principal comparison is structurally
+gone. A malformed live principal identifier remains representable and denies
+`NoSubjectAuthority`, as described in section 11. `Authorizer` implements a
+manual safe `Debug` that reports configuration counts and revision only.
+`DenyReason` implements a stable, non-sensitive `Display`; `Decision::is_allowed`
+remains the only convenience helper.
 
 `InitError::Engine` carries only a private diagnostic suitable for logs; public
 error text must not expose policy internals. The caller maps every `Decision::
@@ -701,8 +762,8 @@ Deny` to its own forbidden response.
 ## 15. Usage examples
 
 The examples use compact helper constructors for readability; the public
-structs are exposed directly. Every request carries the same revision as its
-snapshot in these examples.
+structs are exposed directly. Snapshot authority carries the revision; live
+authority carries caller-resolved roles.
 
 ### Domain group membership
 
@@ -717,7 +778,7 @@ let authorizer = Authorizer::new(AuthorizerConfig {
                         ("membership", "grant"), ("group", "manage")]),
     ],
     assignments: vec![assignment(
-        PrincipalRef { kind: PrincipalKind::Human, id: principal_id("42") },
+        PrincipalRef::human("42"),
         "maintainer",
         "group:acme",
     )],
@@ -726,14 +787,19 @@ let authorizer = Authorizer::new(AuthorizerConfig {
     public_read: BTreeSet::new(),
 }).await?;
 
+let authority = Authority::Snapshot {
+    subject: Subject::Principal(PrincipalRef::human("42")),
+    domain: domain("group:acme/team"),
+    facts_revision: FactsRevision(17),
+};
 // Inherited maintainer authority in the child domain.
 assert!(matches!(
-    authorizer.authorize(&request(principal("human", "42"), "group:acme/team", "content", "write")),
+    authorizer.authorize(&request("group:acme/team", "content", "write"), authority.clone()),
     Decision::Allow
 ));
 // Maintainer authority does not grant owner membership management.
 assert!(matches!(
-    authorizer.authorize(&request(principal("human", "42"), "group:acme/team", "membership", "grant")),
+    authorizer.authorize(&request("group:acme/team", "membership", "grant"), authority),
     Decision::Deny(_)
 ));
 ```
@@ -789,16 +855,13 @@ legacy table is in `consumer-mapping.md`.
 ### Desk application principal and three layers
 
 ```rust
-let subject = Subject::Principal(PrincipalRef {
-    kind: PrincipalKind::Application,
-    id: principal_id("app:reporting"),
-});
+let application = PrincipalRef::application("app:reporting");
 
 let config = AuthorizerConfig {
     roles: vec![role("desk-app", &[("workspace", "read"), ("workspace", "search"),
                                    ("workspace", "shell"), ("workspace", "patch")])],
     assignments: vec![assignment(
-        PrincipalRef { kind: PrincipalKind::Application, id: principal_id("app:reporting") },
+        application.clone(),
         "desk-app",
         "workspace:bound-7",
     )],
@@ -806,14 +869,11 @@ let config = AuthorizerConfig {
 };
 
 let request = AuthzRequest {
-    subject,
-    domain: domain("workspace:bound-7"),
     resource: resource("workspace", Some("bound-7"), "workspace:bound-7"),
     action: action("patch"),
     audience: service("desk-foreman"),
-    facts_revision: FactsRevision(4),
     credential: Some(CredentialContext {
-        principal: PrincipalRef { kind: PrincipalKind::Application, id: principal_id("app:reporting") },
+        principal: application.clone(),
         audience: service("desk-foreman"),
         grants: Attenuation::Grants(BTreeSet::from([Grant {
             domain: domain("workspace:bound-7"),
@@ -831,6 +891,11 @@ let request = AuthzRequest {
         }])),
     }),
 };
+let authority = Authority::Snapshot {
+    subject: Subject::Principal(application),
+    domain: domain("workspace:bound-7"),
+    facts_revision: FactsRevision(4),
+};
 ```
 
 Numeric limits, network policy, workspace binding, and write leases remain
@@ -841,17 +906,11 @@ consumer checks. The engine only decides the scoped action.
 ```rust
 // A request client key is a credential restricted to inference requests.
 let inference = AuthzRequest {
-    subject: Subject::Principal(PrincipalRef {
-        kind: PrincipalKind::Human,
-        id: principal_id("9"),
-    }),
-    domain: domain("gateway"),
     resource: resource("inference", Some("chat"), "gateway"),
     action: action("request"),
     audience: service("prompt-ferry"),
-    facts_revision: FactsRevision(3),
     credential: Some(CredentialContext {
-        principal: PrincipalRef { kind: PrincipalKind::Human, id: principal_id("9") },
+        principal: PrincipalRef::human("9"),
         audience: service("prompt-ferry"),
         grants: Attenuation::Grants(BTreeSet::from([Grant {
             domain: domain("gateway"),
@@ -861,6 +920,11 @@ let inference = AuthzRequest {
         }])),
     }),
     server: None,
+};
+let authority = Authority::Snapshot {
+    subject: Subject::Principal(PrincipalRef::human("9")),
+    domain: domain("gateway"),
+    facts_revision: FactsRevision(3),
 };
 
 // Usage and control remain session/admin capabilities; an inference key
@@ -926,32 +990,38 @@ Permanent pure tests cover:
 - administrator role has no wildcard capability and no private-data bypass;
 - malformed receiving or credential audiences deny in both principal and
   public-read modes;
-- a live role allows a registered capability with no snapshot assignment and a
-  mismatched snapshot revision;
-- live roles bind to the full principal and domain, reject unknown roles for
-  the whole request, and do not fall back to or union snapshot assignments;
+- a live role allows a registered capability with no snapshot assignment;
+- live roles bind to the full principal and domain, reject unknown roles and
+  malformed live principal identifiers for the whole request, and do not fall
+  back to or union snapshot assignments;
 - removing a live admin role denies the next request without rebuilding;
-- live PublicRead is rejected and a role-like principal id does not self-
-  authorize;
+- a role-like principal id does not self-authorize;
 - live-path audience, cross-domain, exact-id, multi-domain, empty credential,
   and empty server restrictions still deny;
 - an authorizer with only a service domain allows two independently trusted
-  group domains through the dynamic-domain entrypoint, while both old APIs
-  deny those requests `UnknownDomain`;
-- dynamic facts bind to the full principal and exact request domain, a
-  malformed or mismatched domain denies `InvalidDomain`/`LiveDomainMismatch`,
-  and dynamic domains do not inherit static `g` assignments;
-- dynamic PublicRead, empty, and unknown roles deny; exact group grants do not
-  expand to a child or sibling, scoped tuples remain non-Cartesian, and exact
-  object, audience, resource, action, and resource-id checks are preserved;
+  group domains through `Authority::Resolved`, while `Authority::Snapshot` and
+  `Authority::Registered` deny those requests `UnknownDomain`;
+- live facts bind to the full principal and exact resource domain, malformed
+  domains deny `InvalidDomain`, a different authority/resource domain denies
+  `CrossDomainResource`, and dynamic domains do not inherit static `g`
+  assignments;
+- empty and unknown roles deny; exact group grants do not expand to a child or
+  sibling, scoped tuples remain non-Cartesian, and exact object, audience,
+  resource, action, and resource-id checks are preserved;
+- `Attenuation::deny_all()` denies where `unrestricted()` passes, and the
+  exact-id grant helper produces the exact tuple;
+- `AuthorizerConfig::new` starts from empty optional sections and still requires
+  an explicit revision;
+- `Authorizer` debug output reports counts and revision without principals or
+  policy, and `DenyReason` display text is stable and non-sensitive;
 - unknown role/domain/resource/action and engine error deny;
 - duplicate configured domains, duplicate roles, unknown references, invalid
   public-read grants, and hierarchy cycles fail initialization.
 
-The fixed gates are `cargo fmt --all -- --check`,
+The fixed gates are `git diff --check`, `cargo fmt --all -- --check`,
 `cargo check --all-targets --locked`, `cargo test --locked`,
-`cargo clippy --all-targets --locked`, the runnable examples, and
-`git diff --check`.
+`cargo clippy --all-targets --locked`, `cargo doc --no-deps --locked`, and the
+four runnable examples.
 
 ## 17. Open decisions and blockers
 
@@ -959,13 +1029,14 @@ These are not implementation details and must be resolved before the relevant
 consumer migration, not guessed in code.
 
 1. **Dynamic-facts consumer integration.** The core now provides trusted
-   live-resolved role and dynamic-domain entrypoints, so consumers with current
-   facts do not need a revisioned snapshot for authority. Remaining work is
-   per-consumer adapter integration and admission ownership: resolve the target
-   domain's existence and roles from verified introspection/SQL, never from
-   client claims or an old snapshot. The core still does not provide a revision
-   database, cross-process invalidation, or independent proof of domain
-   existence, and snapshot mode is not a drop-in for live membership by itself.
+   live-resolved roles through `Authority::Registered` and
+   `Authority::Resolved`, so consumers with current facts do not need a
+   revisioned snapshot for authority. Remaining work is per-consumer adapter
+   integration and admission ownership: resolve the target domain's existence
+   and roles from verified introspection/SQL, never from client claims or an old
+   snapshot. The core still does not provide a revision database, cross-process
+   invalidation, or independent proof of domain existence, and snapshot mode is
+   not a drop-in for live membership by itself.
 2. **Delegation boundary.** Confirm that member-edit permission never implies
    the right to grant owner or higher authority. The target rule is stricter
    than Context69's current behavior.
