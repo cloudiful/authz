@@ -95,7 +95,7 @@ mapping below never relies on a bare id for identity.
 | Public group read | Exact public-read grant for the route/domain/resource; not viewer membership |
 | PAT scope | Typed credential grants: one grant per domain, resource kind, optional exact resource id, and action |
 | PAT `group_scope` | Exact grant domains for the named group ids; `All` or absent means unrestricted; no descendant expansion |
-| Role authority | `current_role` SQL bound to `group:<id>` through `authorize_with_resolved_domain`; token grants are attenuation, never role authority |
+| Role authority | `current_role` SQL bound to `group:<id>` through `Authorizer::authorize(..., Authority::Resolved(...))`; token grants are attenuation, never role authority |
 | Token `All` / session | Unrestricted group attenuation, but the current resolved role is still required |
 | Service scope | Separate `ServiceId` check; never merged with the group-domain check |
 | `is_admin` | Explicit `admin` control-plane role; current private-data/group powers must be enumerated as capabilities, not kept as blanket bypass |
@@ -110,8 +110,9 @@ mapping below never relies on a bare id for identity.
 - Admin scope no longer implies private group data or every content action.
 - **Freshness and dynamic domains:** Context69 resolves group membership from
   live SQL per request, and its group ids are dynamic rather than a fixed
-  service-domain list. The P3
-  `Authorizer::authorize_with_resolved_domain` entrypoint fits that shape: the
+  service-domain list. The
+  `Authority::Resolved(&ResolvedRoles)` authority on the single
+  `Authorizer::authorize` entrypoint fits that shape: the
   consumer keeps its live SQL membership read, establishes that the target
   group currently exists, and passes trusted `ResolvedRoles` for the full
   principal and the exact `group:<id>` domain. The core then applies its static
@@ -137,7 +138,7 @@ mapping below never relies on a bare id for identity.
 at an immutable revision, replace the local rank comparator with the shared
 domain-role adapter where the live path is settled. Keep the existing SQL
 inheritance query as the trusted role source, bind its result to the exact
-`group:<id>`, and pass it through `authorize_with_resolved_domain`; do not
+`group:<id>`, and pass it through `Authority::Resolved`; do not
 register dynamic group ids as a static domain list, move group membership to a
 long-lived snapshot, or rebuild Casbin per request. Base the new Context69
 branch on current main, leave PR104 untouched, and mark the replacement as

@@ -1,75 +1,67 @@
-use std::collections::BTreeSet;
-
 use cloudiful_authz::{
-    Action, Authorizer, AuthorizerConfig, AuthzRequest, Capability, Decision, DenyReason,
-    DomainHierarchy, DomainId, FactsRevision, PrincipalId, PrincipalKind, PrincipalRef,
-    ResolvedRoles, ResourceKind, ResourceRef, RoleId, RoleSpec, ServiceId, Subject,
+    Action, Authority, Authorizer, AuthorizerConfig, AuthzRequest, Capability, Decision,
+    DenyReason, FactsRevision, PrincipalRef, ResolvedRoles, ResourceKind, ResourceRef, RoleId,
+    RoleSpec, ServiceId,
 };
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let principal = PrincipalRef {
-        kind: PrincipalKind::Human,
-        id: PrincipalId::new("42"),
-    };
-    let authorizer = Authorizer::new(AuthorizerConfig {
-        facts_revision: FactsRevision(1),
-        domains: vec![DomainId::new("service")],
-        roles: vec![RoleSpec {
-            id: RoleId::new("viewer"),
-            capabilities: BTreeSet::from([Capability {
-                resource: ResourceKind::new("page"),
-                action: Action::new("read"),
-            }]),
+    let principal = PrincipalRef::human("42");
+    let config = AuthorizerConfig::new(
+        FactsRevision(1),
+        ["service"],
+        [RoleSpec {
+            id: RoleId::from("viewer"),
+            capabilities: [Capability::new("page", "read")].into(),
         }],
-        assignments: vec![],
-        global_assignments: vec![],
-        hierarchy: DomainHierarchy::default(),
-        public_read: BTreeSet::new(),
-    })
-    .await?;
+    );
+    let authorizer = Authorizer::new(config).await?;
 
     let request = |domain: &str| AuthzRequest {
-        subject: Subject::Principal(principal.clone()),
-        domain: DomainId::new(domain),
         resource: ResourceRef {
-            kind: ResourceKind::new("page"),
+            kind: ResourceKind::from("page"),
             id: None,
-            domain: DomainId::new(domain),
+            domain: domain.into(),
         },
-        action: Action::new("read"),
-        audience: ServiceId::new("docs-service"),
-        facts_revision: FactsRevision(1),
+        action: Action::from("read"),
+        audience: ServiceId::from("docs-service"),
         credential: None,
         server: None,
     };
-    let facts = |domain: &str, roles: &[&str]| ResolvedRoles {
-        principal: principal.clone(),
-        domain: DomainId::new(domain),
-        roles: roles.iter().map(|role| RoleId::new(*role)).collect(),
+    let facts = |domain: &str, roles: &[&str]| {
+        ResolvedRoles::new(principal.clone(), domain, roles.iter().copied())
     };
 
     assert!(matches!(
-        authorizer.authorize_with_resolved_domain(
+        authorizer.authorize(
             &request("group:alpha"),
-            &facts("group:alpha", &["viewer"])
+            Authority::Resolved(&facts("group:alpha", &["viewer"]))
         ),
         Decision::Allow
     ));
     assert!(matches!(
-        authorizer.authorize_with_resolved_domain(
+        authorizer.authorize(
             &request("group:beta"),
-            &facts("group:beta", &["viewer"])
+            Authority::Resolved(&facts("group:beta", &["viewer"]))
         ),
         Decision::Allow
     ));
     assert_eq!(
-        authorizer
-            .authorize_with_resolved_domain(&request("group:beta"), &facts("group:beta", &[])),
+        authorizer.authorize(
+            &request("group:beta"),
+            Authority::Resolved(&facts("group:beta", &[]))
+        ),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
     assert_eq!(
-        authorizer.authorize(&request("group:alpha")),
+        authorizer.authorize(
+            &request("group:alpha"),
+            Authority::Snapshot {
+                subject: cloudiful_authz::Subject::Principal(principal.clone()),
+                domain: "group:alpha".into(),
+                facts_revision: FactsRevision(1),
+            }
+        ),
         Decision::Deny(DenyReason::UnknownDomain)
     );
 

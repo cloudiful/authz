@@ -1,41 +1,35 @@
 use std::collections::BTreeSet;
 
 use cloudiful_authz::{
-    Action, Attenuation, Authorizer, AuthorizerConfig, AuthzRequest, Capability, CredentialContext,
-    Decision, DenyReason, DomainHierarchy, DomainId, FactsRevision, GlobalAssignment, Grant,
-    InitError, PrincipalId, PrincipalKind, PrincipalRef, PublicReadGrant, ResolvedRoles,
-    ResourceId, ResourceKind, ResourceRef, RoleAssignment, RoleId, RoleSpec, ServerContext,
-    ServiceId, Subject,
+    Action, Attenuation, Authority, Authorizer, AuthorizerConfig, AuthzRequest, Capability,
+    CredentialContext, Decision, DenyReason, DomainHierarchy, DomainId, FactsRevision,
+    GlobalAssignment, Grant, InitError, PrincipalKind, PrincipalRef, PublicReadGrant,
+    ResolvedRoles, ResourceId, ResourceKind, ResourceRef, RoleAssignment, RoleId, RoleSpec,
+    ServerContext, ServiceId, Subject,
 };
 
 fn domain(value: &str) -> DomainId {
-    DomainId::new(value)
+    DomainId::from(value)
 }
 
 fn role(id: &str, capabilities: &[(&str, &str)]) -> RoleSpec {
     RoleSpec {
-        id: RoleId::new(id),
+        id: RoleId::from(id),
         capabilities: capabilities
             .iter()
-            .map(|(resource, action)| Capability {
-                resource: ResourceKind::new(*resource),
-                action: Action::new(*action),
-            })
+            .map(|(resource, action)| Capability::new(*resource, *action))
             .collect(),
     }
 }
 
 fn principal(kind: PrincipalKind, id: &str) -> PrincipalRef {
-    PrincipalRef {
-        kind,
-        id: PrincipalId::new(id),
-    }
+    PrincipalRef::new(kind, id)
 }
 
 fn assignment(principal: PrincipalRef, role: &str, domain_value: &str) -> RoleAssignment {
     RoleAssignment {
         principal,
-        role: RoleId::new(role),
+        role: RoleId::from(role),
         domain: domain(domain_value),
     }
 }
@@ -48,22 +42,17 @@ fn public_grant(
 ) -> PublicReadGrant {
     PublicReadGrant {
         domain: domain(domain_value),
-        resource: ResourceKind::new(resource),
-        resource_id: id.map(ResourceId::new),
-        action: Action::new(action),
+        resource: ResourceKind::from(resource),
+        resource_id: id.map(ResourceId::from),
+        action: Action::from(action),
     }
 }
 
 fn config() -> AuthorizerConfig {
-    AuthorizerConfig {
-        facts_revision: FactsRevision(7),
-        domains: vec![
-            domain("tenant:a"),
-            domain("tenant:a/child"),
-            domain("tenant:b"),
-            domain("admin"),
-        ],
-        roles: vec![
+    let mut config = AuthorizerConfig::new(
+        FactsRevision(7),
+        ["tenant:a", "tenant:a/child", "tenant:b", "admin"],
+        vec![
             role("viewer", &[("content", "read"), ("content", "list")]),
             role(
                 "maintainer",
@@ -86,33 +75,33 @@ fn config() -> AuthorizerConfig {
             role("admin", &[("admin", "read"), ("admin", "write")]),
             role("machine", &[("job", "run")]),
         ],
-        assignments: vec![
-            assignment(
-                principal(PrincipalKind::Human, "42"),
-                "maintainer",
-                "tenant:a",
-            ),
-            assignment(principal(PrincipalKind::Human, "42"), "viewer", "tenant:b"),
-            assignment(
-                principal(PrincipalKind::Service, "7"),
-                "machine",
-                "tenant:a",
-            ),
-            assignment(principal(PrincipalKind::Human, "1"), "admin", "admin"),
-        ],
-        global_assignments: Vec::new(),
-        hierarchy: DomainHierarchy {
-            edges: vec![(domain("tenant:a/child"), domain("tenant:a"))],
-        },
-        public_read: BTreeSet::from([public_grant("tenant:a", "content", None, "read")]),
-    }
+    );
+    config.assignments = vec![
+        assignment(
+            principal(PrincipalKind::Human, "42"),
+            "maintainer",
+            "tenant:a",
+        ),
+        assignment(principal(PrincipalKind::Human, "42"), "viewer", "tenant:b"),
+        assignment(
+            principal(PrincipalKind::Service, "7"),
+            "machine",
+            "tenant:a",
+        ),
+        assignment(principal(PrincipalKind::Human, "1"), "admin", "admin"),
+    ];
+    config.hierarchy = DomainHierarchy {
+        edges: vec![(domain("tenant:a/child"), domain("tenant:a"))],
+    };
+    config.public_read = BTreeSet::from([public_grant("tenant:a", "content", None, "read")]);
+    config
 }
 
 fn dynamic_config() -> AuthorizerConfig {
-    AuthorizerConfig {
-        facts_revision: FactsRevision(11),
-        domains: vec![domain("service")],
-        roles: vec![
+    AuthorizerConfig::new(
+        FactsRevision(11),
+        ["service"],
+        vec![
             role("viewer", &[("content", "read"), ("content", "list")]),
             role(
                 "maintainer",
@@ -125,57 +114,70 @@ fn dynamic_config() -> AuthorizerConfig {
             role("owner", &[("membership", "grant")]),
             role("admin", &[("admin", "read")]),
         ],
-        assignments: Vec::new(),
-        global_assignments: Vec::new(),
-        hierarchy: DomainHierarchy::default(),
-        public_read: BTreeSet::new(),
-    }
+    )
 }
 
-fn make_request(
-    subject: Subject,
-    domain_value: &str,
-    resource: &str,
-    action: &str,
-    revision: u64,
-) -> AuthzRequest {
+fn request(domain_value: &str, resource: &str, action: &str) -> AuthzRequest {
     AuthzRequest {
-        subject,
-        domain: domain(domain_value),
         resource: ResourceRef {
-            kind: ResourceKind::new(resource),
+            kind: ResourceKind::from(resource),
             id: None,
             domain: domain(domain_value),
         },
-        action: Action::new(action),
-        audience: ServiceId::new("svc"),
-        facts_revision: FactsRevision(revision),
+        action: Action::from(action),
+        audience: ServiceId::from("svc"),
         credential: None,
         server: None,
     }
 }
 
-fn human_request(id: &str, domain: &str, resource: &str, action: &str) -> AuthzRequest {
-    make_request(
+fn snapshot(subject: Subject, domain_value: &str, revision: u64) -> Authority<'static> {
+    Authority::Snapshot {
+        subject,
+        domain: domain(domain_value),
+        facts_revision: FactsRevision(revision),
+    }
+}
+
+fn snapshot_human(id: &str, domain_value: &str, revision: u64) -> Authority<'static> {
+    snapshot(
         Subject::Principal(principal(PrincipalKind::Human, id)),
-        domain,
-        resource,
-        action,
-        7,
+        domain_value,
+        revision,
     )
+}
+
+fn human(id: &str, domain_value: &str) -> Authority<'static> {
+    snapshot_human(id, domain_value, 7)
+}
+
+fn public_read(domain_value: &str) -> Authority<'static> {
+    snapshot(Subject::PublicRead, domain_value, 7)
 }
 
 fn grant(domain_value: &str, resource: &str, id: Option<&str>, action: &str) -> Grant {
     Grant {
         domain: domain(domain_value),
-        resource: ResourceKind::new(resource),
-        resource_id: id.map(ResourceId::new),
-        action: Action::new(action),
+        resource: ResourceKind::from(resource),
+        resource_id: id.map(ResourceId::from),
+        action: Action::from(action),
     }
 }
 
 fn grants(entries: impl IntoIterator<Item = Grant>) -> Attenuation {
-    Attenuation::Grants(entries.into_iter().collect())
+    Attenuation::grants(entries)
+}
+
+fn resolved(principal: PrincipalRef, domain_value: &str, roles: &[&str]) -> ResolvedRoles {
+    ResolvedRoles::new(principal, domain_value, roles.iter().copied())
+}
+
+fn registered(resolved: &ResolvedRoles) -> Authority<'_> {
+    Authority::Registered(resolved)
+}
+
+fn resolved_authority(resolved: &ResolvedRoles) -> Authority<'_> {
+    Authority::Resolved(resolved)
 }
 
 async fn authorizer_with(config: AuthorizerConfig) -> Authorizer {
@@ -188,16 +190,25 @@ async fn domain_assignment_is_isolated_and_parent_role_inherits_downward() {
 
     assert!(
         authorizer
-            .authorize(&human_request("42", "tenant:a", "content", "write"))
+            .authorize(
+                &request("tenant:a", "content", "write"),
+                human("42", "tenant:a")
+            )
             .is_allowed()
     );
     assert!(
         authorizer
-            .authorize(&human_request("42", "tenant:a/child", "content", "write"))
+            .authorize(
+                &request("tenant:a/child", "content", "write"),
+                human("42", "tenant:a/child")
+            )
             .is_allowed()
     );
     assert_eq!(
-        authorizer.authorize(&human_request("42", "tenant:b", "content", "write")),
+        authorizer.authorize(
+            &request("tenant:b", "content", "write"),
+            human("42", "tenant:b")
+        ),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 }
@@ -207,7 +218,10 @@ async fn rebuilt_snapshot_revokes_a_removed_assignment() {
     let first = authorizer_with(config()).await;
     assert!(
         first
-            .authorize(&human_request("42", "tenant:a/child", "content", "write"))
+            .authorize(
+                &request("tenant:a/child", "content", "write"),
+                snapshot_human("42", "tenant:a/child", 7)
+            )
             .is_allowed()
     );
 
@@ -217,10 +231,11 @@ async fn rebuilt_snapshot_revokes_a_removed_assignment() {
         .retain(|assignment| assignment.principal != principal(PrincipalKind::Human, "42"));
     let second = authorizer_with(next).await;
 
-    let mut request = human_request("42", "tenant:a/child", "content", "write");
-    request.facts_revision = FactsRevision(8);
     assert_eq!(
-        second.authorize(&request),
+        second.authorize(
+            &request("tenant:a/child", "content", "write"),
+            snapshot_human("42", "tenant:a/child", 8)
+        ),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 }
@@ -231,15 +246,24 @@ async fn exact_capability_and_unknown_universe_are_enforced() {
 
     assert!(
         authorizer
-            .authorize(&human_request("42", "tenant:a", "content", "read"))
+            .authorize(
+                &request("tenant:a", "content", "read"),
+                human("42", "tenant:a")
+            )
             .is_allowed()
     );
     assert_eq!(
-        authorizer.authorize(&human_request("42", "tenant:a", "content", "delete")),
+        authorizer.authorize(
+            &request("tenant:a", "content", "delete"),
+            human("42", "tenant:a")
+        ),
         Decision::Deny(DenyReason::UnknownAction)
     );
     assert_eq!(
-        authorizer.authorize(&human_request("42", "tenant:a", "unknown", "read")),
+        authorizer.authorize(
+            &request("tenant:a", "unknown", "read"),
+            human("42", "tenant:a")
+        ),
         Decision::Deny(DenyReason::UnknownResource)
     );
 }
@@ -248,27 +272,29 @@ async fn exact_capability_and_unknown_universe_are_enforced() {
 async fn principal_kind_and_role_name_collisions_do_not_grant_authority() {
     let authorizer = authorizer_with(config()).await;
 
-    let service_with_human_id = make_request(
+    let service_with_human_id = snapshot(
         Subject::Principal(principal(PrincipalKind::Service, "42")),
         "tenant:a",
-        "content",
-        "write",
         7,
     );
     assert_eq!(
-        authorizer.authorize(&service_with_human_id),
+        authorizer.authorize(
+            &request("tenant:a", "content", "write"),
+            service_with_human_id
+        ),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 
-    let principal_named_like_a_role = make_request(
+    let principal_named_like_a_role = snapshot(
         Subject::Principal(principal(PrincipalKind::Human, "maintainer")),
         "tenant:a",
-        "content",
-        "write",
         7,
     );
     assert_eq!(
-        authorizer.authorize(&principal_named_like_a_role),
+        authorizer.authorize(
+            &request("tenant:a", "content", "write"),
+            principal_named_like_a_role
+        ),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 }
@@ -276,34 +302,44 @@ async fn principal_kind_and_role_name_collisions_do_not_grant_authority() {
 #[tokio::test]
 async fn unrestricted_and_empty_credential_and_server_attenuation_differ() {
     let authorizer = authorizer_with(config()).await;
-    let mut base = human_request("42", "tenant:b", "content", "read");
+    let mut credential_request = request("tenant:b", "content", "read");
 
-    base.credential = Some(CredentialContext {
+    credential_request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("svc"),
-        grants: Attenuation::Unrestricted,
+        audience: ServiceId::from("svc"),
+        grants: Attenuation::unrestricted(),
     });
-    assert!(authorizer.authorize(&base).is_allowed());
+    assert!(
+        authorizer
+            .authorize(&credential_request, human("42", "tenant:b"))
+            .is_allowed()
+    );
 
-    base.credential = Some(CredentialContext {
+    credential_request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("svc"),
-        grants: grants([]),
+        audience: ServiceId::from("svc"),
+        grants: Attenuation::deny_all(),
     });
     assert_eq!(
-        authorizer.authorize(&base),
+        authorizer.authorize(&credential_request, human("42", "tenant:b")),
         Decision::Deny(DenyReason::CredentialGrantMissing)
     );
 
-    let mut server_base = human_request("42", "tenant:b", "content", "read");
+    let mut server_base = request("tenant:b", "content", "read");
     server_base.server = Some(ServerContext {
-        grants: Attenuation::Unrestricted,
+        grants: Attenuation::unrestricted(),
     });
-    assert!(authorizer.authorize(&server_base).is_allowed());
+    assert!(
+        authorizer
+            .authorize(&server_base, human("42", "tenant:b"))
+            .is_allowed()
+    );
 
-    server_base.server = Some(ServerContext { grants: grants([]) });
+    server_base.server = Some(ServerContext {
+        grants: Attenuation::deny_all(),
+    });
     assert_eq!(
-        authorizer.authorize(&server_base),
+        authorizer.authorize(&server_base, human("42", "tenant:b")),
         Decision::Deny(DenyReason::ServerGrantMissing)
     );
 }
@@ -323,89 +359,100 @@ async fn multi_domain_grants_do_not_form_a_cartesian_product() {
     ));
     let authorizer = authorizer_with(config).await;
 
-    let mut request = human_request("43", "tenant:a", "content", "write");
+    let mut request = request("tenant:a", "content", "write");
     request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "43"),
-        audience: ServiceId::new("svc"),
+        audience: ServiceId::from("svc"),
         grants: grants([
             grant("tenant:a", "content", None, "read"),
             grant("tenant:b", "content", None, "write"),
         ]),
     });
     assert_eq!(
-        authorizer.authorize(&request),
+        authorizer.authorize(&request, human("43", "tenant:a")),
         Decision::Deny(DenyReason::CredentialGrantMissing)
     );
 
-    request.domain = domain("tenant:b");
     request.resource.domain = domain("tenant:b");
-    assert!(authorizer.authorize(&request).is_allowed());
+    assert!(
+        authorizer
+            .authorize(&request, human("43", "tenant:b"))
+            .is_allowed()
+    );
 }
 
 #[tokio::test]
 async fn exact_resource_grants_require_the_same_exact_id() {
     let authorizer = authorizer_with(config()).await;
 
-    let mut request = human_request("42", "tenant:b", "content", "read");
-    request.resource.id = Some(ResourceId::new("doc-1"));
+    let mut request = request("tenant:b", "content", "read");
+    request.resource.id = Some(ResourceId::from("doc-1"));
     request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("svc"),
+        audience: ServiceId::from("svc"),
         grants: grants([grant("tenant:b", "content", Some("doc-1"), "read")]),
     });
-    assert!(authorizer.authorize(&request).is_allowed());
+    assert!(
+        authorizer
+            .authorize(&request, human("42", "tenant:b"))
+            .is_allowed()
+    );
 
-    request.resource.id = Some(ResourceId::new("doc-2"));
+    request.resource.id = Some(ResourceId::from("doc-2"));
     assert_eq!(
-        authorizer.authorize(&request),
+        authorizer.authorize(&request, human("42", "tenant:b")),
         Decision::Deny(DenyReason::CredentialGrantMissing)
     );
 
     request.resource.id = None;
     assert_eq!(
-        authorizer.authorize(&request),
+        authorizer.authorize(&request, human("42", "tenant:b")),
         Decision::Deny(DenyReason::CredentialGrantMissing)
     );
 
     request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("svc"),
+        audience: ServiceId::from("svc"),
         grants: grants([grant("tenant:b", "content", None, "read")]),
     });
-    assert!(authorizer.authorize(&request).is_allowed());
+    assert!(
+        authorizer
+            .authorize(&request, human("42", "tenant:b"))
+            .is_allowed()
+    );
 }
 
 #[tokio::test]
 async fn credential_principal_and_audience_mismatches_deny() {
     let authorizer = authorizer_with(config()).await;
-    let mut request = human_request("42", "tenant:b", "content", "read");
+    let mut request = request("tenant:b", "content", "read");
     request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "43"),
-        audience: ServiceId::new("svc"),
-        grants: Attenuation::Unrestricted,
+        audience: ServiceId::from("svc"),
+        grants: Attenuation::unrestricted(),
     });
     assert_eq!(
-        authorizer.authorize(&request),
+        authorizer.authorize(&request, human("42", "tenant:b")),
         Decision::Deny(DenyReason::CredentialPrincipalMismatch)
     );
 
     request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Service, "42"),
-        audience: ServiceId::new("svc"),
-        grants: Attenuation::Unrestricted,
+        audience: ServiceId::from("svc"),
+        grants: Attenuation::unrestricted(),
     });
     assert_eq!(
-        authorizer.authorize(&request),
+        authorizer.authorize(&request, human("42", "tenant:b")),
         Decision::Deny(DenyReason::CredentialPrincipalMismatch)
     );
 
     request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("other"),
-        grants: Attenuation::Unrestricted,
+        audience: ServiceId::from("other"),
+        grants: Attenuation::unrestricted(),
     });
     assert_eq!(
-        authorizer.authorize(&request),
+        authorizer.authorize(&request, human("42", "tenant:b")),
         Decision::Deny(DenyReason::CredentialAudienceMismatch)
     );
 }
@@ -413,30 +460,36 @@ async fn credential_principal_and_audience_mismatches_deny() {
 #[tokio::test]
 async fn public_read_is_limited_and_still_attenuated() {
     let authorizer = authorizer_with(config()).await;
-    let mut request = make_request(Subject::PublicRead, "tenant:a", "content", "read", 7);
-    assert!(authorizer.authorize(&request).is_allowed());
+    let mut read_request = request("tenant:a", "content", "read");
+    assert!(
+        authorizer
+            .authorize(&read_request, public_read("tenant:a"))
+            .is_allowed()
+    );
 
-    request.credential = Some(CredentialContext {
+    read_request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "unknown"),
-        audience: ServiceId::new("svc"),
-        grants: grants([]),
+        audience: ServiceId::from("svc"),
+        grants: Attenuation::deny_all(),
     });
     assert_eq!(
-        authorizer.authorize(&request),
+        authorizer.authorize(&read_request, public_read("tenant:a")),
         Decision::Deny(DenyReason::CredentialGrantMissing)
     );
 
-    request.credential = None;
-    request.server = Some(ServerContext { grants: grants([]) });
+    read_request.credential = None;
+    read_request.server = Some(ServerContext {
+        grants: Attenuation::deny_all(),
+    });
     assert_eq!(
-        authorizer.authorize(&request),
+        authorizer.authorize(&read_request, public_read("tenant:a")),
         Decision::Deny(DenyReason::ServerGrantMissing)
     );
 
-    request.server = None;
-    let write = make_request(Subject::PublicRead, "tenant:a", "content", "write", 7);
+    read_request.server = None;
+    let write = request("tenant:a", "content", "write");
     assert_eq!(
-        authorizer.authorize(&write),
+        authorizer.authorize(&write, public_read("tenant:a")),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 }
@@ -445,16 +498,16 @@ async fn public_read_is_limited_and_still_attenuated() {
 async fn unknown_domains_and_cross_domain_resources_deny() {
     let authorizer = authorizer_with(config()).await;
 
-    let unknown = human_request("42", "tenant:missing", "content", "read");
+    let unknown = request("tenant:missing", "content", "read");
     assert_eq!(
-        authorizer.authorize(&unknown),
+        authorizer.authorize(&unknown, human("42", "tenant:missing")),
         Decision::Deny(DenyReason::UnknownDomain)
     );
 
-    let mut cross_domain = human_request("42", "tenant:a", "content", "read");
+    let mut cross_domain = request("tenant:a", "content", "read");
     cross_domain.resource.domain = domain("tenant:b");
     assert_eq!(
-        authorizer.authorize(&cross_domain),
+        authorizer.authorize(&cross_domain, human("42", "tenant:a")),
         Decision::Deny(DenyReason::CrossDomainResource)
     );
 }
@@ -466,19 +519,23 @@ async fn public_read_exact_id_grants_require_the_same_id() {
         BTreeSet::from([public_grant("tenant:a", "content", Some("doc-1"), "read")]);
     let authorizer = authorizer_with(config).await;
 
-    let mut request = make_request(Subject::PublicRead, "tenant:a", "content", "read", 7);
-    request.resource.id = Some(ResourceId::new("doc-1"));
-    assert!(authorizer.authorize(&request).is_allowed());
+    let mut request = request("tenant:a", "content", "read");
+    request.resource.id = Some(ResourceId::from("doc-1"));
+    assert!(
+        authorizer
+            .authorize(&request, public_read("tenant:a"))
+            .is_allowed()
+    );
 
-    request.resource.id = Some(ResourceId::new("doc-2"));
+    request.resource.id = Some(ResourceId::from("doc-2"));
     assert_eq!(
-        authorizer.authorize(&request),
+        authorizer.authorize(&request, public_read("tenant:a")),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 
     request.resource.id = None;
     assert_eq!(
-        authorizer.authorize(&request),
+        authorizer.authorize(&request, public_read("tenant:a")),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 }
@@ -487,54 +544,53 @@ async fn public_read_exact_id_grants_require_the_same_id() {
 async fn malformed_audiences_deny_in_principal_and_public_modes() {
     let authorizer = authorizer_with(config()).await;
 
-    let mut principal_empty = human_request("42", "tenant:a", "content", "read");
-    principal_empty.audience = ServiceId::new("");
+    let mut principal_empty = request("tenant:a", "content", "read");
+    principal_empty.audience = ServiceId::from("");
     assert_eq!(
-        authorizer.authorize(&principal_empty),
+        authorizer.authorize(&principal_empty, human("42", "tenant:a")),
         Decision::Deny(DenyReason::InvalidAudience)
     );
 
-    let mut principal_control = human_request("42", "tenant:a", "content", "read");
-    principal_control.audience = ServiceId::new("svc\n");
+    let mut principal_control = request("tenant:a", "content", "read");
+    principal_control.audience = ServiceId::from("svc\n");
     assert_eq!(
-        authorizer.authorize(&principal_control),
+        authorizer.authorize(&principal_control, human("42", "tenant:a")),
         Decision::Deny(DenyReason::InvalidAudience)
     );
 
-    let mut principal_wildcard = human_request("42", "tenant:a", "content", "read");
-    principal_wildcard.audience = ServiceId::new("*");
+    let mut principal_wildcard = request("tenant:a", "content", "read");
+    principal_wildcard.audience = ServiceId::from("*");
     assert_eq!(
-        authorizer.authorize(&principal_wildcard),
+        authorizer.authorize(&principal_wildcard, human("42", "tenant:a")),
         Decision::Deny(DenyReason::InvalidAudience)
     );
 
-    let mut credential_empty = human_request("42", "tenant:a", "content", "read");
+    let mut credential_empty = request("tenant:a", "content", "read");
     credential_empty.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new(""),
-        grants: Attenuation::Unrestricted,
+        audience: ServiceId::from(""),
+        grants: Attenuation::unrestricted(),
     });
     assert_eq!(
-        authorizer.authorize(&credential_empty),
+        authorizer.authorize(&credential_empty, human("42", "tenant:a")),
         Decision::Deny(DenyReason::InvalidAudience)
     );
 
-    let mut public_empty = make_request(Subject::PublicRead, "tenant:a", "content", "read", 7);
-    public_empty.audience = ServiceId::new("");
+    let mut public_empty = request("tenant:a", "content", "read");
+    public_empty.audience = ServiceId::from("");
     assert_eq!(
-        authorizer.authorize(&public_empty),
+        authorizer.authorize(&public_empty, public_read("tenant:a")),
         Decision::Deny(DenyReason::InvalidAudience)
     );
 
-    let mut public_credential_wildcard =
-        make_request(Subject::PublicRead, "tenant:a", "content", "read", 7);
+    let mut public_credential_wildcard = request("tenant:a", "content", "read");
     public_credential_wildcard.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("*"),
-        grants: Attenuation::Unrestricted,
+        audience: ServiceId::from("*"),
+        grants: Attenuation::unrestricted(),
     });
     assert_eq!(
-        authorizer.authorize(&public_credential_wildcard),
+        authorizer.authorize(&public_credential_wildcard, public_read("tenant:a")),
         Decision::Deny(DenyReason::InvalidAudience)
     );
 }
@@ -542,10 +598,9 @@ async fn malformed_audiences_deny_in_principal_and_public_modes() {
 #[tokio::test]
 async fn stale_facts_revision_denies_before_authority() {
     let authorizer = authorizer_with(config()).await;
-    let mut request = human_request("42", "tenant:a", "content", "read");
-    request.facts_revision = FactsRevision(6);
+    let request = request("tenant:a", "content", "read");
     assert_eq!(
-        authorizer.authorize(&request),
+        authorizer.authorize(&request, snapshot_human("42", "tenant:a", 6)),
         Decision::Deny(DenyReason::StaleFacts)
     );
     assert_eq!(authorizer.facts_revision(), FactsRevision(7));
@@ -554,36 +609,26 @@ async fn stale_facts_revision_denies_before_authority() {
 #[tokio::test]
 async fn admin_has_no_wildcard_and_application_has_no_implicit_role() {
     let authorizer = authorizer_with(config()).await;
-    let admin = make_request(
-        Subject::Principal(principal(PrincipalKind::Human, "1")),
-        "admin",
-        "admin",
-        "read",
-        7,
+    let admin = request("admin", "admin", "read");
+    assert!(
+        authorizer
+            .authorize(&admin, human("1", "admin"))
+            .is_allowed()
     );
-    assert!(authorizer.authorize(&admin).is_allowed());
 
-    let admin_delete = make_request(
-        Subject::Principal(principal(PrincipalKind::Human, "1")),
-        "admin",
-        "admin",
-        "delete",
-        7,
-    );
+    let admin_delete = request("admin", "admin", "delete");
     assert_eq!(
-        authorizer.authorize(&admin_delete),
+        authorizer.authorize(&admin_delete, human("1", "admin")),
         Decision::Deny(DenyReason::UnknownAction)
     );
 
-    let application = make_request(
+    let application = snapshot(
         Subject::Principal(principal(PrincipalKind::Application, "app")),
         "tenant:a",
-        "job",
-        "run",
         7,
     );
     assert_eq!(
-        authorizer.authorize(&application),
+        authorizer.authorize(&request("tenant:a", "job", "run"), application),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 }
@@ -600,24 +645,18 @@ async fn duplicate_assignments_are_deduplicated() {
     let authorizer = authorizer_with(config).await;
     assert!(
         authorizer
-            .authorize(&human_request("42", "tenant:a", "content", "write"))
+            .authorize(
+                &request("tenant:a", "content", "write"),
+                human("42", "tenant:a")
+            )
             .is_allowed()
     );
-}
-
-fn resolved(principal: PrincipalRef, domain_value: &str, roles: &[&str]) -> ResolvedRoles {
-    ResolvedRoles {
-        principal,
-        domain: domain(domain_value),
-        roles: roles.iter().map(|role| RoleId::new(*role)).collect(),
-    }
 }
 
 #[tokio::test]
 async fn live_roles_allow_without_snapshot_assignment_or_matching_revision() {
     let authorizer = authorizer_with(config()).await;
-    let mut request = human_request("99", "tenant:a", "content", "read");
-    request.facts_revision = FactsRevision(999);
+    let request = request("tenant:a", "content", "read");
     let facts = resolved(
         principal(PrincipalKind::Human, "99"),
         "tenant:a",
@@ -626,51 +665,38 @@ async fn live_roles_allow_without_snapshot_assignment_or_matching_revision() {
 
     assert!(
         authorizer
-            .authorize_with_roles(&request, &facts)
+            .authorize(&request, registered(&facts))
             .is_allowed()
     );
 }
 
 #[tokio::test]
-async fn live_roles_bind_to_the_full_principal_and_request_domain() {
+async fn live_roles_bind_to_the_authority_principal_and_request_domain() {
     let authorizer = authorizer_with(config()).await;
-    let request = human_request("42", "tenant:a", "content", "read");
+    let request = request("tenant:a", "content", "read");
 
-    let wrong_principal = resolved(
-        principal(PrincipalKind::Human, "43"),
-        "tenant:a",
-        &["viewer"],
-    );
+    let malformed_principal =
+        resolved(principal(PrincipalKind::Human, ""), "tenant:a", &["viewer"]);
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &wrong_principal),
-        Decision::Deny(DenyReason::LivePrincipalMismatch)
+        authorizer.authorize(&request, registered(&malformed_principal)),
+        Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 
-    let wrong_kind = resolved(
-        principal(PrincipalKind::Service, "42"),
-        "tenant:a",
-        &["viewer"],
-    );
-    assert_eq!(
-        authorizer.authorize_with_roles(&request, &wrong_kind),
-        Decision::Deny(DenyReason::LivePrincipalMismatch)
-    );
-
-    let wrong_domain = resolved(
+    let group_b_facts = resolved(
         principal(PrincipalKind::Human, "42"),
         "tenant:b",
         &["viewer"],
     );
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &wrong_domain),
-        Decision::Deny(DenyReason::LiveDomainMismatch)
+        authorizer.authorize(&request, registered(&group_b_facts)),
+        Decision::Deny(DenyReason::CrossDomainResource)
     );
 }
 
 #[tokio::test]
 async fn live_unknown_roles_and_empty_roles_deny_the_request() {
     let authorizer = authorizer_with(config()).await;
-    let request = human_request("42", "tenant:a", "content", "read");
+    let request = request("tenant:a", "content", "read");
 
     let unknown_role = resolved(
         principal(PrincipalKind::Human, "42"),
@@ -678,13 +704,13 @@ async fn live_unknown_roles_and_empty_roles_deny_the_request() {
         &["viewer", "missing"],
     );
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &unknown_role),
+        authorizer.authorize(&request, registered(&unknown_role)),
         Decision::Deny(DenyReason::UnknownRole)
     );
 
     let empty = resolved(principal(PrincipalKind::Human, "42"), "tenant:a", &[]);
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &empty),
+        authorizer.authorize(&request, registered(&empty)),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 }
@@ -692,11 +718,11 @@ async fn live_unknown_roles_and_empty_roles_deny_the_request() {
 #[tokio::test]
 async fn live_roles_do_not_fall_back_to_or_union_snapshot_assignments() {
     let authorizer = authorizer_with(config()).await;
-    let mut request = human_request("42", "tenant:a", "content", "write");
+    let mut request = request("tenant:a", "content", "write");
 
     let no_live_roles = resolved(principal(PrincipalKind::Human, "42"), "tenant:a", &[]);
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &no_live_roles),
+        authorizer.authorize(&request, registered(&no_live_roles)),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 
@@ -706,20 +732,19 @@ async fn live_roles_do_not_fall_back_to_or_union_snapshot_assignments() {
         &["viewer"],
     );
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &only_viewer),
+        authorizer.authorize(&request, registered(&only_viewer)),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
-    assert!(authorizer.authorize(&request).is_allowed());
-
-    let reader = resolved(
-        principal(PrincipalKind::Human, "42"),
-        "tenant:a",
-        &["viewer"],
-    );
-    request.action = Action::new("read");
     assert!(
         authorizer
-            .authorize_with_roles(&request, &reader)
+            .authorize(&request, human("42", "tenant:a"))
+            .is_allowed()
+    );
+
+    request.action = Action::from("read");
+    assert!(
+        authorizer
+            .authorize(&request, registered(&only_viewer))
             .is_allowed()
     );
 }
@@ -727,23 +752,17 @@ async fn live_roles_do_not_fall_back_to_or_union_snapshot_assignments() {
 #[tokio::test]
 async fn live_role_removal_denies_on_the_next_request_without_rebuild() {
     let authorizer = authorizer_with(config()).await;
-    let request = make_request(
-        Subject::Principal(principal(PrincipalKind::Human, "1")),
-        "admin",
-        "admin",
-        "read",
-        7,
-    );
+    let request = request("admin", "admin", "read");
     let with_admin = resolved(principal(PrincipalKind::Human, "1"), "admin", &["admin"]);
     let without_admin = resolved(principal(PrincipalKind::Human, "1"), "admin", &[]);
 
     assert!(
         authorizer
-            .authorize_with_roles(&request, &with_admin)
+            .authorize(&request, registered(&with_admin))
             .is_allowed()
     );
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &without_admin),
+        authorizer.authorize(&request, registered(&without_admin)),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 }
@@ -751,57 +770,41 @@ async fn live_role_removal_denies_on_the_next_request_without_rebuild() {
 #[tokio::test]
 async fn live_admin_is_an_ordinary_explicit_role_with_no_wildcard() {
     let authorizer = authorizer_with(config()).await;
-    let admin_read = make_request(
-        Subject::Principal(principal(PrincipalKind::Human, "1")),
-        "tenant:a",
-        "admin",
-        "read",
-        7,
-    );
-    let admin_delete = make_request(
-        Subject::Principal(principal(PrincipalKind::Human, "1")),
-        "tenant:a",
-        "admin",
-        "delete",
-        7,
-    );
+    let admin_read = request("tenant:a", "admin", "read");
+    let admin_delete = request("tenant:a", "admin", "delete");
     let facts = resolved(principal(PrincipalKind::Human, "1"), "tenant:a", &["admin"]);
 
     assert!(
         authorizer
-            .authorize_with_roles(&admin_read, &facts)
+            .authorize(&admin_read, registered(&facts))
             .is_allowed()
     );
     assert_eq!(
-        authorizer.authorize_with_roles(&admin_delete, &facts),
+        authorizer.authorize(&admin_delete, registered(&facts)),
         Decision::Deny(DenyReason::UnknownAction)
     );
 
-    let content_write = human_request("1", "tenant:a", "content", "write");
+    let content_write = request("tenant:a", "content", "write");
     assert_eq!(
-        authorizer.authorize_with_roles(&content_write, &facts),
+        authorizer.authorize(&content_write, registered(&facts)),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 }
 
 #[tokio::test]
-async fn live_public_read_is_rejected_and_role_like_ids_do_not_self_authorize() {
+async fn live_authority_is_principal_only_and_role_like_ids_do_not_self_authorize() {
     let authorizer = authorizer_with(config()).await;
-    let public = make_request(Subject::PublicRead, "tenant:a", "content", "read", 7);
-    let facts = resolved(
-        principal(PrincipalKind::Human, "42"),
-        "tenant:a",
-        &["viewer"],
-    );
-    assert_eq!(
-        authorizer.authorize_with_roles(&public, &facts),
-        Decision::Deny(DenyReason::PublicReadNotAllowed)
-    );
-
-    let role_like_request = human_request("admin", "tenant:a", "admin", "read");
+    let role_like_request = request("tenant:a", "admin", "read");
     let empty = resolved(principal(PrincipalKind::Human, "admin"), "tenant:a", &[]);
     assert_eq!(
-        authorizer.authorize_with_roles(&role_like_request, &empty),
+        authorizer.authorize(&role_like_request, registered(&empty)),
+        Decision::Deny(DenyReason::NoSubjectAuthority)
+    );
+
+    let viewer_like_request = request("tenant:a", "content", "read");
+    let no_roles = resolved(principal(PrincipalKind::Human, "viewer"), "tenant:a", &[]);
+    assert_eq!(
+        authorizer.authorize(&viewer_like_request, registered(&no_roles)),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 }
@@ -809,61 +812,63 @@ async fn live_public_read_is_rejected_and_role_like_ids_do_not_self_authorize() 
 #[tokio::test]
 async fn live_path_keeps_audience_credential_and_server_checks() {
     let authorizer = authorizer_with(config()).await;
-    let mut request = human_request("42", "tenant:b", "content", "read");
+    let mut request = request("tenant:b", "content", "read");
     let facts = resolved(
         principal(PrincipalKind::Human, "42"),
         "tenant:b",
         &["viewer"],
     );
 
-    request.audience = ServiceId::new("");
+    request.audience = ServiceId::from("");
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &facts),
+        authorizer.authorize(&request, registered(&facts)),
         Decision::Deny(DenyReason::InvalidAudience)
     );
 
-    request.audience = ServiceId::new("svc");
+    request.audience = ServiceId::from("svc");
     request.resource.domain = domain("tenant:a");
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &facts),
+        authorizer.authorize(&request, registered(&facts)),
         Decision::Deny(DenyReason::CrossDomainResource)
     );
 
     request.resource.domain = domain("tenant:b");
-    request.action = Action::new("delete");
+    request.action = Action::from("delete");
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &facts),
+        authorizer.authorize(&request, registered(&facts)),
         Decision::Deny(DenyReason::UnknownAction)
     );
 
-    request.action = Action::new("read");
-    request.resource.id = Some(ResourceId::new("doc-1"));
+    request.action = Action::from("read");
+    request.resource.id = Some(ResourceId::from("doc-1"));
     request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("svc"),
+        audience: ServiceId::from("svc"),
         grants: grants([grant("tenant:b", "content", Some("doc-1"), "read")]),
     });
     assert!(
         authorizer
-            .authorize_with_roles(&request, &facts)
+            .authorize(&request, registered(&facts))
             .is_allowed()
     );
 
-    request.resource.id = Some(ResourceId::new("doc-2"));
+    request.resource.id = Some(ResourceId::from("doc-2"));
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &facts),
+        authorizer.authorize(&request, registered(&facts)),
         Decision::Deny(DenyReason::CredentialGrantMissing)
     );
 
     request.resource.id = None;
     request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("svc"),
-        grants: Attenuation::Unrestricted,
+        audience: ServiceId::from("svc"),
+        grants: Attenuation::unrestricted(),
     });
-    request.server = Some(ServerContext { grants: grants([]) });
+    request.server = Some(ServerContext {
+        grants: Attenuation::deny_all(),
+    });
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &facts),
+        authorizer.authorize(&request, registered(&facts)),
         Decision::Deny(DenyReason::ServerGrantMissing)
     );
 }
@@ -871,7 +876,7 @@ async fn live_path_keeps_audience_credential_and_server_checks() {
 #[tokio::test]
 async fn live_path_keeps_empty_and_multi_domain_credential_restrictions() {
     let authorizer = authorizer_with(config()).await;
-    let mut request = human_request("43", "tenant:a", "content", "write");
+    let mut request = request("tenant:a", "content", "write");
     let facts = resolved(
         principal(PrincipalKind::Human, "43"),
         "tenant:a",
@@ -880,96 +885,75 @@ async fn live_path_keeps_empty_and_multi_domain_credential_restrictions() {
 
     request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "43"),
-        audience: ServiceId::new("svc"),
-        grants: grants([]),
+        audience: ServiceId::from("svc"),
+        grants: Attenuation::deny_all(),
     });
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &facts),
+        authorizer.authorize(&request, registered(&facts)),
         Decision::Deny(DenyReason::CredentialGrantMissing)
     );
 
     request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "43"),
-        audience: ServiceId::new("svc"),
+        audience: ServiceId::from("svc"),
         grants: grants([
             grant("tenant:a", "content", None, "read"),
             grant("tenant:b", "content", None, "write"),
         ]),
     });
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &facts),
+        authorizer.authorize(&request, registered(&facts)),
         Decision::Deny(DenyReason::CredentialGrantMissing)
     );
 
     request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "44"),
-        audience: ServiceId::new("svc"),
-        grants: Attenuation::Unrestricted,
+        audience: ServiceId::from("svc"),
+        grants: Attenuation::unrestricted(),
     });
     assert_eq!(
-        authorizer.authorize_with_roles(&request, &facts),
+        authorizer.authorize(&request, registered(&facts)),
         Decision::Deny(DenyReason::CredentialPrincipalMismatch)
     );
 }
 
 #[tokio::test]
-async fn resolved_domain_allows_current_group_domains_and_old_apis_deny_unknown_domain() {
+async fn resolved_domain_allows_current_group_domains_and_registered_apis_deny_unknown_domain() {
     let authorizer = authorizer_with(dynamic_config()).await;
 
     for group in ["group:alpha", "group:beta"] {
-        let request = human_request("42", group, "content", "read");
+        let request = request(group, "content", "read");
         let facts = resolved(principal(PrincipalKind::Human, "42"), group, &["viewer"]);
 
         assert!(
             authorizer
-                .authorize_with_resolved_domain(&request, &facts)
+                .authorize(&request, resolved_authority(&facts))
                 .is_allowed()
         );
-
-        let mut current_revision = request.clone();
-        current_revision.facts_revision = FactsRevision(11);
         assert_eq!(
-            authorizer.authorize(&current_revision),
+            authorizer.authorize(&request, snapshot_human("42", group, 11)),
             Decision::Deny(DenyReason::UnknownDomain)
         );
         assert_eq!(
-            authorizer.authorize_with_roles(&current_revision, &facts),
+            authorizer.authorize(&request, registered(&facts)),
             Decision::Deny(DenyReason::UnknownDomain)
-        );
-
-        let mut live_revision = request;
-        live_revision.facts_revision = FactsRevision(999);
-        assert!(
-            authorizer
-                .authorize_with_resolved_domain(&live_revision, &facts)
-                .is_allowed()
         );
     }
 }
 
 #[tokio::test]
-async fn resolved_domain_binds_the_full_principal_and_request_domain() {
+async fn resolved_domain_binds_the_authority_principal_and_request_domain() {
     let authorizer = authorizer_with(dynamic_config()).await;
-    let request = human_request("42", "group:alpha", "content", "read");
+    let base_request = request("group:alpha", "content", "read");
 
-    let wrong_id = resolved(
-        principal(PrincipalKind::Human, "43"),
+    let malformed_principal = resolved(
+        principal(PrincipalKind::Human, ""),
         "group:alpha",
         &["viewer"],
     );
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&request, &wrong_id),
-        Decision::Deny(DenyReason::LivePrincipalMismatch)
-    );
-
-    let wrong_kind = resolved(
-        principal(PrincipalKind::Service, "42"),
-        "group:alpha",
-        &["viewer"],
-    );
-    assert_eq!(
-        authorizer.authorize_with_resolved_domain(&request, &wrong_kind),
-        Decision::Deny(DenyReason::LivePrincipalMismatch)
+        authorizer.authorize(&base_request, resolved_authority(&malformed_principal)),
+        Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 
     let group_a_facts = resolved(
@@ -977,10 +961,10 @@ async fn resolved_domain_binds_the_full_principal_and_request_domain() {
         "group:alpha",
         &["viewer"],
     );
-    let group_b_request = human_request("42", "group:beta", "content", "read");
+    let group_b_request = request("group:beta", "content", "read");
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&group_b_request, &group_a_facts),
-        Decision::Deny(DenyReason::LiveDomainMismatch)
+        authorizer.authorize(&group_b_request, resolved_authority(&group_a_facts)),
+        Decision::Deny(DenyReason::CrossDomainResource)
     );
 }
 
@@ -994,76 +978,60 @@ async fn resolved_domain_rejects_malformed_domains_and_cross_domain_resources() 
     );
 
     for malformed in ["", "group:\n", "*"] {
-        let mut request = human_request("42", malformed, "content", "read");
-        assert_eq!(
-            authorizer.authorize_with_resolved_domain(&request, &facts),
-            Decision::Deny(DenyReason::InvalidDomain)
-        );
-        request.domain = domain("group:alpha");
+        let mut request = request("group:alpha", "content", "read");
         request.resource.domain = domain(malformed);
-        let malformed_resource_domain = resolved(
-            principal(PrincipalKind::Human, "42"),
-            "group:alpha",
-            &["viewer"],
-        );
         assert_eq!(
-            authorizer.authorize_with_resolved_domain(&request, &malformed_resource_domain),
+            authorizer.authorize(&request, resolved_authority(&facts)),
             Decision::Deny(DenyReason::InvalidDomain)
         );
     }
 
-    let request = human_request("42", "group:alpha", "content", "read");
+    let request = request("group:alpha", "content", "read");
     let malformed_facts = resolved(principal(PrincipalKind::Human, "42"), "", &["viewer"]);
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&request, &malformed_facts),
+        authorizer.authorize(&request, resolved_authority(&malformed_facts)),
         Decision::Deny(DenyReason::InvalidDomain)
     );
 
-    let mut cross_domain = human_request("42", "group:alpha", "content", "read");
+    let mut cross_domain = request;
     cross_domain.resource.domain = domain("group:beta");
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&cross_domain, &facts),
+        authorizer.authorize(&cross_domain, resolved_authority(&facts)),
         Decision::Deny(DenyReason::CrossDomainResource)
     );
 }
 
 #[tokio::test]
-async fn resolved_domain_rejects_public_empty_unknown_and_snapshot_only_authority() {
+async fn resolved_domain_rejects_empty_unknown_and_snapshot_only_authority() {
     let authorizer = authorizer_with(dynamic_config()).await;
-    let public = make_request(Subject::PublicRead, "group:alpha", "content", "read", 11);
-    let facts = resolved(
-        principal(PrincipalKind::Human, "42"),
-        "group:alpha",
-        &["viewer"],
-    );
-    assert_eq!(
-        authorizer.authorize_with_resolved_domain(&public, &facts),
-        Decision::Deny(DenyReason::PublicReadNotAllowed)
-    );
 
-    let request = human_request("42", "group:alpha", "content", "read");
+    let live_request = request("group:alpha", "content", "read");
     let unknown = resolved(
         principal(PrincipalKind::Human, "42"),
         "group:alpha",
         &["viewer", "missing"],
     );
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&request, &unknown),
+        authorizer.authorize(&live_request, resolved_authority(&unknown)),
         Decision::Deny(DenyReason::UnknownRole)
     );
 
     let empty = resolved(principal(PrincipalKind::Human, "42"), "group:alpha", &[]);
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&request, &empty),
+        authorizer.authorize(&live_request, resolved_authority(&empty)),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 
     let snapshot = authorizer_with(config()).await;
-    let registered = human_request("42", "tenant:a", "content", "write");
-    assert!(snapshot.authorize(&registered).is_allowed());
+    let registered_request = request("tenant:a", "content", "write");
+    assert!(
+        snapshot
+            .authorize(&registered_request, human("42", "tenant:a"))
+            .is_allowed()
+    );
     let no_live_roles = resolved(principal(PrincipalKind::Human, "42"), "tenant:a", &[]);
     assert_eq!(
-        snapshot.authorize_with_resolved_domain(&registered, &no_live_roles),
+        snapshot.authorize(&registered_request, resolved_authority(&no_live_roles)),
         Decision::Deny(DenyReason::NoSubjectAuthority)
     );
 }
@@ -1072,10 +1040,10 @@ async fn resolved_domain_rejects_public_empty_unknown_and_snapshot_only_authorit
 async fn resolved_domain_exact_group_grants_do_not_expand_to_children_or_siblings() {
     let authorizer = authorizer_with(dynamic_config()).await;
 
-    let mut request = human_request("42", "group:alpha", "content", "read");
-    request.credential = Some(CredentialContext {
+    let mut alpha_request = request("group:alpha", "content", "read");
+    alpha_request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("svc"),
+        audience: ServiceId::from("svc"),
         grants: grants([grant("group:alpha", "content", None, "read")]),
     });
     let alpha_facts = resolved(
@@ -1085,16 +1053,16 @@ async fn resolved_domain_exact_group_grants_do_not_expand_to_children_or_sibling
     );
     assert!(
         authorizer
-            .authorize_with_resolved_domain(&request, &alpha_facts)
+            .authorize(&alpha_request, resolved_authority(&alpha_facts))
             .is_allowed()
     );
 
     for other in ["group:alpha/child", "group:beta"] {
-        let mut other_request = human_request("42", other, "content", "read");
-        other_request.credential = request.credential.clone();
+        let mut other_request = request(other, "content", "read");
+        other_request.credential = alpha_request.credential.clone();
         let other_facts = resolved(principal(PrincipalKind::Human, "42"), other, &["viewer"]);
         assert_eq!(
-            authorizer.authorize_with_resolved_domain(&other_request, &other_facts),
+            authorizer.authorize(&other_request, resolved_authority(&other_facts)),
             Decision::Deny(DenyReason::CredentialGrantMissing)
         );
     }
@@ -1103,7 +1071,7 @@ async fn resolved_domain_exact_group_grants_do_not_expand_to_children_or_sibling
 #[tokio::test]
 async fn resolved_domain_preserves_empty_credential_and_server_ceilings() {
     let authorizer = authorizer_with(dynamic_config()).await;
-    let request = human_request("42", "group:alpha", "content", "read");
+    let request = request("group:alpha", "content", "read");
     let facts = resolved(
         principal(PrincipalKind::Human, "42"),
         "group:alpha",
@@ -1112,47 +1080,49 @@ async fn resolved_domain_preserves_empty_credential_and_server_ceilings() {
 
     assert!(
         authorizer
-            .authorize_with_resolved_domain(&request, &facts)
+            .authorize(&request, resolved_authority(&facts))
             .is_allowed()
     );
 
     let mut empty_credential = request.clone();
     empty_credential.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("svc"),
-        grants: grants([]),
+        audience: ServiceId::from("svc"),
+        grants: Attenuation::deny_all(),
     });
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&empty_credential, &facts),
+        authorizer.authorize(&empty_credential, resolved_authority(&facts)),
         Decision::Deny(DenyReason::CredentialGrantMissing)
     );
 
     let mut empty_server = request.clone();
-    empty_server.server = Some(ServerContext { grants: grants([]) });
+    empty_server.server = Some(ServerContext {
+        grants: Attenuation::deny_all(),
+    });
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&empty_server, &facts),
+        authorizer.authorize(&empty_server, resolved_authority(&facts)),
         Decision::Deny(DenyReason::ServerGrantMissing)
     );
 
     let mut wrong_credential_principal = request.clone();
     wrong_credential_principal.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "43"),
-        audience: ServiceId::new("svc"),
-        grants: Attenuation::Unrestricted,
+        audience: ServiceId::from("svc"),
+        grants: Attenuation::unrestricted(),
     });
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&wrong_credential_principal, &facts),
+        authorizer.authorize(&wrong_credential_principal, resolved_authority(&facts)),
         Decision::Deny(DenyReason::CredentialPrincipalMismatch)
     );
 
     let mut wrong_credential_audience = request;
     wrong_credential_audience.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("other"),
-        grants: Attenuation::Unrestricted,
+        audience: ServiceId::from("other"),
+        grants: Attenuation::unrestricted(),
     });
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&wrong_credential_audience, &facts),
+        authorizer.authorize(&wrong_credential_audience, resolved_authority(&facts)),
         Decision::Deny(DenyReason::CredentialAudienceMismatch)
     );
 }
@@ -1166,36 +1136,36 @@ async fn resolved_domain_preserves_scoped_tuple_and_exact_object_denials() {
         &["maintainer"],
     );
 
-    let mut request = human_request("42", "group:alpha", "content", "write");
+    let mut request = request("group:alpha", "content", "write");
     request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("svc"),
+        audience: ServiceId::from("svc"),
         grants: grants([
             grant("group:alpha", "content", None, "read"),
             grant("group:beta", "content", None, "write"),
         ]),
     });
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&request, &facts),
+        authorizer.authorize(&request, resolved_authority(&facts)),
         Decision::Deny(DenyReason::CredentialGrantMissing)
     );
 
-    request.action = Action::new("read");
-    request.resource.id = Some(ResourceId::new("doc-2"));
+    request.action = Action::from("read");
+    request.resource.id = Some(ResourceId::from("doc-2"));
     request.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("svc"),
+        audience: ServiceId::from("svc"),
         grants: grants([grant("group:alpha", "content", Some("doc-1"), "read")]),
     });
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&request, &facts),
+        authorizer.authorize(&request, resolved_authority(&facts)),
         Decision::Deny(DenyReason::CredentialGrantMissing)
     );
 
-    request.resource.id = Some(ResourceId::new("doc-1"));
+    request.resource.id = Some(ResourceId::from("doc-1"));
     assert!(
         authorizer
-            .authorize_with_resolved_domain(&request, &facts)
+            .authorize(&request, resolved_authority(&facts))
             .is_allowed()
     );
 }
@@ -1209,43 +1179,43 @@ async fn resolved_domain_still_rejects_unknown_universe_and_malformed_audiences(
         &["viewer"],
     );
 
-    let mut invalid_audience = human_request("42", "group:alpha", "content", "read");
-    invalid_audience.audience = ServiceId::new("");
+    let mut invalid_audience = request("group:alpha", "content", "read");
+    invalid_audience.audience = ServiceId::from("");
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&invalid_audience, &facts),
+        authorizer.authorize(&invalid_audience, resolved_authority(&facts)),
         Decision::Deny(DenyReason::InvalidAudience)
     );
 
-    let mut invalid_credential_audience = human_request("42", "group:alpha", "content", "read");
+    let mut invalid_credential_audience = request("group:alpha", "content", "read");
     invalid_credential_audience.credential = Some(CredentialContext {
         principal: principal(PrincipalKind::Human, "42"),
-        audience: ServiceId::new("*"),
-        grants: Attenuation::Unrestricted,
+        audience: ServiceId::from("*"),
+        grants: Attenuation::unrestricted(),
     });
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&invalid_credential_audience, &facts),
+        authorizer.authorize(&invalid_credential_audience, resolved_authority(&facts)),
         Decision::Deny(DenyReason::InvalidAudience)
     );
 
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(
-            &human_request("42", "group:alpha", "unknown", "read"),
-            &facts
+        authorizer.authorize(
+            &request("group:alpha", "unknown", "read"),
+            resolved_authority(&facts)
         ),
         Decision::Deny(DenyReason::UnknownResource)
     );
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(
-            &human_request("42", "group:alpha", "content", "delete"),
-            &facts
+        authorizer.authorize(
+            &request("group:alpha", "content", "delete"),
+            resolved_authority(&facts)
         ),
         Decision::Deny(DenyReason::UnknownAction)
     );
 
-    let mut invalid_resource_id = human_request("42", "group:alpha", "content", "read");
-    invalid_resource_id.resource.id = Some(ResourceId::new(""));
+    let mut invalid_resource_id = request("group:alpha", "content", "read");
+    invalid_resource_id.resource.id = Some(ResourceId::from(""));
     assert_eq!(
-        authorizer.authorize_with_resolved_domain(&invalid_resource_id, &facts),
+        authorizer.authorize(&invalid_resource_id, resolved_authority(&facts)),
         Decision::Deny(DenyReason::UnknownResource)
     );
 }
@@ -1258,7 +1228,7 @@ async fn construction_rejects_invalid_references_and_cycles() {
         .push(role("viewer", &[("content", "read")]));
     assert!(matches!(
         Authorizer::new(duplicate_role).await,
-        Err(InitError::DuplicateRole(role)) if role == RoleId::new("viewer")
+        Err(InitError::DuplicateRole(role)) if role == RoleId::from("viewer")
     ));
 
     let mut unknown_role = config();
@@ -1269,7 +1239,7 @@ async fn construction_rejects_invalid_references_and_cycles() {
     ));
     assert!(matches!(
         Authorizer::new(unknown_role).await,
-        Err(InitError::UnknownRole(role)) if role == RoleId::new("missing")
+        Err(InitError::UnknownRole(role)) if role == RoleId::from("missing")
     ));
 
     let mut unknown_domain = config();
@@ -1280,7 +1250,7 @@ async fn construction_rejects_invalid_references_and_cycles() {
     ));
     assert!(matches!(
         Authorizer::new(unknown_domain).await,
-        Err(InitError::UnknownDomain(domain)) if domain == DomainId::new("missing")
+        Err(InitError::UnknownDomain(domain)) if domain == DomainId::from("missing")
     ));
 
     let mut cycle = config();
@@ -1311,7 +1281,7 @@ async fn construction_rejects_invalid_references_and_cycles() {
     duplicate_domain.domains.push(domain("tenant:a"));
     assert!(matches!(
         Authorizer::new(duplicate_domain).await,
-        Err(InitError::DuplicateDomain(domain)) if domain == DomainId::new("tenant:a")
+        Err(InitError::DuplicateDomain(domain)) if domain == DomainId::from("tenant:a")
     ));
 }
 
@@ -1320,17 +1290,23 @@ async fn global_assignment_applies_in_each_registered_domain() {
     let mut config = config();
     config.global_assignments.push(GlobalAssignment {
         principal: principal(PrincipalKind::Human, "88"),
-        role: RoleId::new("viewer"),
+        role: RoleId::from("viewer"),
     });
     let authorizer = authorizer_with(config).await;
     assert!(
         authorizer
-            .authorize(&human_request("88", "tenant:a", "content", "read"))
+            .authorize(
+                &request("tenant:a", "content", "read"),
+                human("88", "tenant:a")
+            )
             .is_allowed()
     );
     assert!(
         authorizer
-            .authorize(&human_request("88", "tenant:b", "content", "read"))
+            .authorize(
+                &request("tenant:b", "content", "read"),
+                human("88", "tenant:b")
+            )
             .is_allowed()
     );
 }
@@ -1339,16 +1315,87 @@ async fn global_assignment_applies_in_each_registered_domain() {
 async fn role_capabilities_are_exposed_without_wildcards() {
     let authorizer = authorizer_with(config()).await;
     let capabilities = authorizer
-        .role_capabilities(&RoleId::new("admin"))
+        .role_capabilities(&RoleId::from("admin"))
         .expect("admin role exists");
-    assert!(capabilities.contains(&Capability {
-        resource: ResourceKind::new("admin"),
-        action: Action::new("read"),
-    }));
-    assert!(!capabilities.contains(&Capability {
-        resource: ResourceKind::new("admin"),
-        action: Action::new("delete"),
-    }));
+    assert!(capabilities.contains(&Capability::new("admin", "read")));
+    assert!(!capabilities.contains(&Capability::new("admin", "delete")));
+}
+
+#[tokio::test]
+async fn exact_id_grant_helper_builds_the_exact_tuple() {
+    let authorizer = authorizer_with(config()).await;
+    let mut request = request("tenant:b", "content", "read");
+    request.resource.id = Some(ResourceId::from("doc-1"));
+    request.credential = Some(CredentialContext {
+        principal: principal(PrincipalKind::Human, "42"),
+        audience: ServiceId::from("svc"),
+        grants: Attenuation::grants([
+            Grant::new("tenant:b", "content", "read").with_resource_id("doc-1")
+        ]),
+    });
+    assert!(
+        authorizer
+            .authorize(&request, human("42", "tenant:b"))
+            .is_allowed()
+    );
+
+    request.resource.id = Some(ResourceId::from("doc-2"));
+    assert_eq!(
+        authorizer.authorize(&request, human("42", "tenant:b")),
+        Decision::Deny(DenyReason::CredentialGrantMissing)
+    );
+}
+
+#[tokio::test]
+async fn config_constructor_starts_from_empty_optional_sections() {
+    let config = AuthorizerConfig::new(
+        FactsRevision(3),
+        ["docs"],
+        [role("viewer", &[("page", "read")])],
+    );
+    assert_eq!(config.facts_revision, FactsRevision(3));
+    assert!(config.assignments.is_empty());
+    assert!(config.global_assignments.is_empty());
+    assert!(config.hierarchy.edges.is_empty());
+    assert!(config.public_read.is_empty());
+
+    let authorizer = authorizer_with(config).await;
+    let request = request("docs", "page", "read");
+    assert_eq!(
+        authorizer.authorize(&request, snapshot_human("42", "docs", 3)),
+        Decision::Deny(DenyReason::NoSubjectAuthority)
+    );
+
+    let facts = resolved(principal(PrincipalKind::Human, "42"), "docs", &["viewer"]);
+    assert!(
+        authorizer
+            .authorize(&request, registered(&facts))
+            .is_allowed()
+    );
+}
+
+#[tokio::test]
+async fn authorizer_debug_reports_counts_without_identity_or_policy() {
+    let authorizer = authorizer_with(config()).await;
+    let debug = format!("{authorizer:?}");
+    assert!(debug.contains("Authorizer"));
+    assert!(debug.contains("facts_revision"));
+    assert!(debug.contains("domains: 4"));
+    assert!(!debug.contains("tenant:a"));
+    assert!(!debug.contains("viewer"));
+}
+
+#[test]
+fn deny_reason_display_is_stable_and_non_sensitive() {
+    assert_eq!(DenyReason::UnknownDomain.to_string(), "unknown domain");
+    assert_eq!(
+        DenyReason::CredentialPrincipalMismatch.to_string(),
+        "credential principal mismatch"
+    );
+    assert_eq!(
+        DenyReason::EngineError.to_string(),
+        "authorization engine error"
+    );
 }
 
 #[test]
