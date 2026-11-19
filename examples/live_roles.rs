@@ -1,65 +1,42 @@
-use std::collections::BTreeSet;
-
 use cloudiful_authz::{
-    Action, Authorizer, AuthorizerConfig, AuthzRequest, Capability, Decision, DomainHierarchy,
-    DomainId, FactsRevision, PrincipalId, PrincipalKind, PrincipalRef, ResolvedRoles, ResourceKind,
-    ResourceRef, RoleId, RoleSpec, ServiceId, Subject,
+    Action, Authority, Authorizer, AuthorizerConfig, AuthzRequest, Capability, Decision,
+    FactsRevision, PrincipalRef, ResolvedRoles, ResourceKind, ResourceRef, RoleId, RoleSpec,
+    ServiceId,
 };
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let principal = PrincipalRef {
-        kind: PrincipalKind::Human,
-        id: PrincipalId::new("42"),
-    };
-    let authorizer = Authorizer::new(AuthorizerConfig {
-        facts_revision: FactsRevision(1),
-        domains: vec![DomainId::new("docs")],
-        roles: vec![RoleSpec {
-            id: RoleId::new("viewer"),
-            capabilities: BTreeSet::from([Capability {
-                resource: ResourceKind::new("page"),
-                action: Action::new("read"),
-            }]),
+    let principal = PrincipalRef::human("42");
+    let config = AuthorizerConfig::new(
+        FactsRevision(1),
+        ["docs"],
+        [RoleSpec {
+            id: RoleId::from("viewer"),
+            capabilities: [Capability::new("page", "read")].into(),
         }],
-        assignments: vec![],
-        global_assignments: vec![],
-        hierarchy: DomainHierarchy::default(),
-        public_read: BTreeSet::new(),
-    })
-    .await?;
+    );
+    let authorizer = Authorizer::new(config).await?;
 
     let request = AuthzRequest {
-        subject: Subject::Principal(principal.clone()),
-        domain: DomainId::new("docs"),
         resource: ResourceRef {
-            kind: ResourceKind::new("page"),
+            kind: ResourceKind::from("page"),
             id: None,
-            domain: DomainId::new("docs"),
+            domain: "docs".into(),
         },
-        action: Action::new("read"),
-        audience: ServiceId::new("docs-service"),
-        facts_revision: FactsRevision(999),
+        action: Action::from("read"),
+        audience: ServiceId::from("docs-service"),
         credential: None,
         server: None,
     };
-    let current = ResolvedRoles {
-        principal: principal.clone(),
-        domain: DomainId::new("docs"),
-        roles: BTreeSet::from([RoleId::new("viewer")]),
-    };
-    let removed = ResolvedRoles {
-        principal,
-        domain: DomainId::new("docs"),
-        roles: BTreeSet::new(),
-    };
+    let current = ResolvedRoles::new(principal.clone(), "docs", ["viewer"]);
+    let removed = ResolvedRoles::new(principal, "docs", [] as [&str; 0]);
 
     assert!(matches!(
-        authorizer.authorize_with_roles(&request, &current),
+        authorizer.authorize(&request, Authority::Registered(&current)),
         Decision::Allow
     ));
     assert!(matches!(
-        authorizer.authorize_with_roles(&request, &removed),
+        authorizer.authorize(&request, Authority::Registered(&removed)),
         Decision::Deny(_)
     ));
     println!("live roles authorize the current request and removal denies without a rebuild");

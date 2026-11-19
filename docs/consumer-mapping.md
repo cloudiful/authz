@@ -91,10 +91,13 @@ mapping below never relies on a bare id for identity.
 | Viewer | `viewer` role: content read/search capabilities |
 | Maintainer | `maintainer` role: viewer capabilities plus content write/modify |
 | Owner | `owner` role: maintainer capabilities plus group/membership management |
-| Parent membership inheritance | Domain hierarchy `child group -> parent group`; same role inherited, union of roles if multiple |
+| Parent membership inheritance | The trusted SQL resolver supplies the effective inherited role for the exact group domain; dynamic group ids are not registered hierarchy |
 | Public group read | Exact public-read grant for the route/domain/resource; not viewer membership |
 | PAT scope | Typed credential grants: one grant per domain, resource kind, optional exact resource id, and action |
 | PAT `group_scope` | Exact grant domains for the named group ids; `All` or absent means unrestricted; no descendant expansion |
+| Role authority | `current_role` SQL bound to `group:<id>` through `Authorizer::authorize(..., Authority::Resolved(...))`; token grants are attenuation, never role authority |
+| Token `All` / session | Unrestricted group attenuation, but the current resolved role is still required |
+| Service scope | Separate `ServiceId` check; never merged with the group-domain check |
 | `is_admin` | Explicit `admin` control-plane role; current private-data/group powers must be enumerated as capabilities, not kept as blanket bypass |
 
 **Target differences and gaps**
@@ -105,24 +108,42 @@ mapping below never relies on a bare id for identity.
   the actor does not hold requires the delegation checks in
   `authorization-model.md` section 7. This is stricter than current behavior.
 - Admin scope no longer implies private group data or every content action.
-- **Freshness:** Context69 resolves group membership from live SQL per request.
-  The P2 `Authorizer::authorize_with_roles` entrypoint fits that shape: the
-  consumer keeps its live SQL membership read and passes trusted
-  `ResolvedRoles` for the full principal and exact group domain. The core then
-  applies its registered role capabilities and the shared audience, credential,
-  and server checks without rebuilding the engine or relying on a snapshot
-  revision. This removes the core-side blocker for live membership decisions.
-  The consumer still owns freshness and admission: it must resolve roles from
-  verified current data, never from client claims or an old cached snapshot.
-  The core provides no revision database or distributed invalidation.
+- **Freshness and dynamic domains:** Context69 resolves group membership from
+  live SQL per request, and its group ids are dynamic rather than a fixed
+  service-domain list. The
+  `Authority::Resolved(&ResolvedRoles)` authority on the single
+  `Authorizer::authorize` entrypoint fits that shape: the
+  consumer keeps its live SQL membership read, establishes that the target
+  group currently exists, and passes trusted `ResolvedRoles` for the full
+  principal and the exact `group:<id>` domain. The core then applies its static
+  role capabilities and the shared audience, credential, and server checks
+  without registering the group, rebuilding the engine, or relying on a
+  snapshot revision. The consumer still owns freshness and admission: it must
+  resolve the domain existence and roles from verified current data, never from
+  client claims or an old cached snapshot. The core provides no revision
+  database or distributed invalidation.
+- **Role authority versus token scope:** role authority comes only from the
+  current SQL role bound to `group:<id>`. Token `Groups` maps to exact grant
+  tuples over the static registered group-operation capabilities; it never
+  supplies role authority, so it need not be manually intersected with the
+  effective role. Token `All` or a session uses unrestricted group attenuation
+  but still requires the current resolved role. The service scope check and
+  the group-domain check remain distinct.
+- Keep the existing SQL group filters and `require_unrestricted` global-surface
+  restrictions until an equivalent explicit scoped migration. This mapping
+  does not claim that all query filtering is delegated to Casbin. Preserve
+  current-main anonymous MCP rules; they replace the old PR104 defaults.
 
 **Wave A.** Do not rewrite Context69 PR104. After the shared crate is delivered
 at an immutable revision, replace the local rank comparator with the shared
 domain-role adapter where the live path is settled. Keep the existing SQL
-inheritance query as the trusted role source and pass its result through
-`authorize_with_roles`; do not move group membership to a long-lived snapshot
-and do not rebuild Casbin per request. Remove the duplicate policy only in a
-scoped migration.
+inheritance query as the trusted role source, bind its result to the exact
+`group:<id>`, and pass it through `Authority::Resolved`; do not
+register dynamic group ids as a static domain list, move group membership to a
+long-lived snapshot, or rebuild Casbin per request. Base the new Context69
+branch on current main, leave PR104 untouched, and mark the replacement as
+proposed without rewriting, closing, or merging it. Remove the duplicate policy
+only in a scoped migration.
 
 ### 3.2 stock-goes-stonk
 
@@ -395,11 +416,12 @@ Casbin or a role model to them artificially.
    writes.
 2. **Wave A.** Context69 adapter, stock-import, and stock-gateway
    credential/capability mapping. Context69 keeps its existing SQL membership
-   query as the trusted role source and calls the live-resolved-role entrypoint;
-   do not rewrite PR104. stock-import is the first eligible migration because
-   it has a committed baseline; stock-factor is deferred until it has one. The
-   gateway contract revision each consumer pins is preserved. Duplicate
-   `admin_data` interpretation is removed only through scoped issues.
+   query as the trusted role source, binds it to each dynamic `group:<id>`, and
+   calls the dynamic-domain entrypoint; do not rewrite PR104. stock-import is
+   the first eligible migration because it has a committed baseline;
+   stock-factor is deferred until it has one. The gateway contract revision
+   each consumer pins is preserved. Duplicate `admin_data` interpretation is
+   removed only through scoped issues.
 3. **Wave B.** Stock full HTTP/MCP/project migration and desk
    machine/workspace/ceiling migration. Preserve SQL visibility, public/system
    attributes, legacy workspace shell, limits, and leases.
@@ -436,10 +458,11 @@ trust is assumed.
 The detailed list is in `authorization-model.md` section 17. The blocking ones
 for migration are:
 
-1. Context69 live-facts admission ownership: the core live-resolved-role path
-   exists, so the remaining choice is how the consumer guarantees that resolved
-   roles come from verified current data. A revisioned snapshot boundary is no
-   longer required for these decisions.
+1. Context69 live-facts admission ownership: the core live-resolved-role and
+   dynamic-domain entrypoints exist, so the remaining choice is how the
+   consumer guarantees that the target domain and resolved roles come from
+   verified current data. A revisioned snapshot boundary is no longer required
+   for these decisions.
 2. Context69 maintainer-to-owner delegation restriction (target is stricter
    than current behavior).
 3. Enumerated administrator capability sets for Context69, Stock, Stock
