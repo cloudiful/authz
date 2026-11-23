@@ -1,14 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::sync::Arc;
 
 use casbin::{CoreApi, DefaultModel, EnforceContext, Enforcer, MemoryAdapter, MgmtApi};
 
-use crate::encoding::{encode_principal, encode_role, validate_identifier, validate_service_id};
+use crate::encoding::{
+    encode_principal, encode_role, validate_identifier, validate_resolved_domain,
+    validate_service_id,
+};
 use crate::error::InitError;
 use crate::types::{
-    Action, Attenuation, AuthorizerConfig, AuthzRequest, Capability, Decision, DenyReason,
-    DomainHierarchy, DomainId, FactsRevision, PublicReadGrant, ResolvedRoles, ResourceId,
-    ResourceKind, RoleId, Subject,
+    Action, Attenuation, Authority, AuthorizerConfig, AuthzRequest, Capability, Decision,
+    DenyReason, DomainHierarchy, DomainId, FactsRevision, PrincipalRef, PublicReadGrant,
+    ResolvedRoles, ResourceId, ResourceKind, RoleId, Subject,
 };
 
 const MODEL: &str = r#"
@@ -26,6 +30,12 @@ m = g(r.sub, p.sub, r.dom) && r.obj == p.obj && r.act == p.act
 m2 = r2.sub == p.sub && r2.obj == p.obj && r2.act == p.act
 "#;
 
+#[derive(Clone, Copy)]
+enum DomainAdmission {
+    Registered,
+    Resolved,
+}
+
 #[derive(Clone)]
 pub struct Authorizer {
     enforcer: Arc<Enforcer>,
@@ -35,6 +45,20 @@ pub struct Authorizer {
     resources: BTreeSet<ResourceKind>,
     actions: BTreeSet<Action>,
     public_read: BTreeSet<PublicReadGrant>,
+}
+
+impl fmt::Debug for Authorizer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Authorizer")
+            .field("facts_revision", &self.facts_revision)
+            .field("domains", &self.domains.len())
+            .field("roles", &self.roles.len())
+            .field("resources", &self.resources.len())
+            .field("actions", &self.actions.len())
+            .field("public_read", &self.public_read.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Authorizer {
@@ -135,52 +159,82 @@ impl Authorizer {
         })
     }
 
-    pub fn authorize(&self, request: &AuthzRequest) -> Decision {
-        if request.facts_revision != self.facts_revision {
-            return Decision::Deny(DenyReason::StaleFacts);
+    pub fn authorize(&self, request: &AuthzRequest, authority: Authority<'_>) -> Decision {
+        match authority {
+            Authority::Snapshot {
+                subject,
+                domain,
+                facts_revision,
+            } => {
+                if facts_revision != self.facts_revision {
+                    return Decision::Deny(DenyReason::StaleFacts);
+                }
+                if let Some(reason) =
+                    self.common_denial(request, &domain, DomainAdmission::Registered)
+                {
+                    return Decision::Deny(reason);
+                }
+                let subject_allowed = match self.snapshot_authority(request, &subject, &domain) {
+                    Ok(allowed) => allowed,
+                    Err(reason) => return Decision::Deny(reason),
+                };
+                let principal = match &subject {
+                    Subject::Principal(principal) => Some(principal),
+                    Subject::PublicRead => None,
+                };
+                self.finish(request, principal, subject_allowed)
+            }
+            Authority::Registered(resolved) => {
+                if let Some(reason) =
+                    self.common_denial(request, &resolved.domain, DomainAdmission::Registered)
+                {
+                    return Decision::Deny(reason);
+                }
+                if let Some(reason) = self.live_binding_denial(resolved) {
+                    return Decision::Deny(reason);
+                }
+                let subject_allowed = match self.live_authority(request, &resolved.roles) {
+                    Ok(allowed) => allowed,
+                    Err(reason) => return Decision::Deny(reason),
+                };
+                self.finish(request, Some(&resolved.principal), subject_allowed)
+            }
+            Authority::Resolved(resolved) => {
+                if let Some(reason) =
+                    self.common_denial(request, &resolved.domain, DomainAdmission::Resolved)
+                {
+                    return Decision::Deny(reason);
+                }
+                if let Some(reason) = self.live_binding_denial(resolved) {
+                    return Decision::Deny(reason);
+                }
+                let subject_allowed = match self.live_authority(request, &resolved.roles) {
+                    Ok(allowed) => allowed,
+                    Err(reason) => return Decision::Deny(reason),
+                };
+                self.finish(request, Some(&resolved.principal), subject_allowed)
+            }
         }
-        if let Some(reason) = self.common_denial(request) {
-            return Decision::Deny(reason);
-        }
-        let subject_allowed = match self.snapshot_authority(request) {
-            Ok(allowed) => allowed,
-            Err(reason) => return Decision::Deny(reason),
-        };
-        self.finish(request, subject_allowed)
     }
 
-    pub fn authorize_with_roles(
-        &self,
-        request: &AuthzRequest,
-        resolved: &ResolvedRoles,
-    ) -> Decision {
-        if let Some(reason) = self.common_denial(request) {
-            return Decision::Deny(reason);
-        }
-        let Subject::Principal(principal) = &request.subject else {
-            return Decision::Deny(DenyReason::PublicReadNotAllowed);
-        };
-        if validate_identifier(&resolved.principal.id.0).is_err()
-            || &resolved.principal != principal
-        {
-            return Decision::Deny(DenyReason::LivePrincipalMismatch);
-        }
-        if validate_identifier(&resolved.domain.0).is_err() || resolved.domain != request.domain {
-            return Decision::Deny(DenyReason::LiveDomainMismatch);
+    fn live_binding_denial(&self, resolved: &ResolvedRoles) -> Option<DenyReason> {
+        if validate_identifier(&resolved.principal.id.0).is_err() {
+            return Some(DenyReason::NoSubjectAuthority);
         }
         for role in &resolved.roles {
             if !self.roles.contains_key(role) {
-                return Decision::Deny(DenyReason::UnknownRole);
+                return Some(DenyReason::UnknownRole);
             }
         }
-        let subject_allowed = match self.live_authority(request, &resolved.roles) {
-            Ok(allowed) => allowed,
-            Err(reason) => return Decision::Deny(reason),
-        };
-        self.finish(request, subject_allowed)
+        None
     }
 
-    fn common_denial(&self, request: &AuthzRequest) -> Option<DenyReason> {
+    fn common_denial(
+        &self,
+        request: &AuthzRequest,
+        domain: &DomainId,
+        admission: DomainAdmission,
+    ) -> Option<DenyReason> {
         if validate_service_id(&request.audience.0).is_err() {
             return Some(DenyReason::InvalidAudience);
         }
@@ -189,8 +243,19 @@ impl Authorizer {
         {
             return Some(DenyReason::InvalidAudience);
         }
-        if !self.domains.contains(&request.domain) {
-            return Some(DenyReason::UnknownDomain);
+        match admission {
+            DomainAdmission::Registered => {
+                if !self.domains.contains(domain) {
+                    return Some(DenyReason::UnknownDomain);
+                }
+            }
+            DomainAdmission::Resolved => {
+                if validate_resolved_domain(&domain.0).is_err()
+                    || validate_resolved_domain(&request.resource.domain.0).is_err()
+                {
+                    return Some(DenyReason::InvalidDomain);
+                }
+            }
         }
         if !self.resources.contains(&request.resource.kind) {
             return Some(DenyReason::UnknownResource);
@@ -203,14 +268,19 @@ impl Authorizer {
         {
             return Some(DenyReason::UnknownResource);
         }
-        if request.resource.domain != request.domain {
+        if request.resource.domain != *domain {
             return Some(DenyReason::CrossDomainResource);
         }
         None
     }
 
-    fn snapshot_authority(&self, request: &AuthzRequest) -> Result<bool, DenyReason> {
-        match &request.subject {
+    fn snapshot_authority(
+        &self,
+        request: &AuthzRequest,
+        subject: &Subject,
+        domain: &DomainId,
+    ) -> Result<bool, DenyReason> {
+        match subject {
             Subject::Principal(principal) => {
                 if validate_identifier(&principal.id.0).is_err() {
                     return Ok(false);
@@ -219,7 +289,7 @@ impl Authorizer {
                 self.enforcer
                     .enforce((
                         encoded_principal,
-                        request.domain.0.clone(),
+                        domain.0.clone(),
                         request.resource.kind.0.clone(),
                         request.action.0.clone(),
                     ))
@@ -228,7 +298,7 @@ impl Authorizer {
             Subject::PublicRead => Ok(self
                 .public_read
                 .iter()
-                .any(|grant| public_read_matches(grant, request))),
+                .any(|grant| public_read_matches(grant, request, domain))),
         }
     }
 
@@ -263,12 +333,17 @@ impl Authorizer {
         Ok(false)
     }
 
-    fn finish(&self, request: &AuthzRequest, subject_allowed: bool) -> Decision {
+    fn finish(
+        &self,
+        request: &AuthzRequest,
+        authority_principal: Option<&PrincipalRef>,
+        subject_allowed: bool,
+    ) -> Decision {
         if !subject_allowed {
             return Decision::Deny(DenyReason::NoSubjectAuthority);
         }
         if let Some(credential) = &request.credential {
-            if let Subject::Principal(principal) = &request.subject
+            if let Some(principal) = authority_principal
                 && &credential.principal != principal
             {
                 return Decision::Deny(DenyReason::CredentialPrincipalMismatch);
@@ -276,12 +351,12 @@ impl Authorizer {
             if credential.audience != request.audience {
                 return Decision::Deny(DenyReason::CredentialAudienceMismatch);
             }
-            if !attenuation_matches(&credential.grants, request) {
+            if !attenuation_matches(&credential.grants, request, &request.resource.domain) {
                 return Decision::Deny(DenyReason::CredentialGrantMissing);
             }
         }
         if let Some(server) = &request.server
-            && !attenuation_matches(&server.grants, request)
+            && !attenuation_matches(&server.grants, request, &request.resource.domain)
         {
             return Decision::Deny(DenyReason::ServerGrantMissing);
         }
@@ -438,11 +513,15 @@ fn build_descendants(
     Ok(descendants)
 }
 
-fn attenuation_matches(attenuation: &Attenuation, request: &AuthzRequest) -> bool {
+fn attenuation_matches(
+    attenuation: &Attenuation,
+    request: &AuthzRequest,
+    domain: &DomainId,
+) -> bool {
     match attenuation {
         Attenuation::Unrestricted => true,
         Attenuation::Grants(grants) => grants.iter().any(|grant| {
-            grant.domain == request.domain
+            grant.domain == *domain
                 && grant.resource == request.resource.kind
                 && grant.action == request.action
                 && resource_id_matches(grant.resource_id.as_ref(), request.resource.id.as_ref())
@@ -450,8 +529,8 @@ fn attenuation_matches(attenuation: &Attenuation, request: &AuthzRequest) -> boo
     }
 }
 
-fn public_read_matches(grant: &PublicReadGrant, request: &AuthzRequest) -> bool {
-    grant.domain == request.domain
+fn public_read_matches(grant: &PublicReadGrant, request: &AuthzRequest, domain: &DomainId) -> bool {
+    grant.domain == *domain
         && grant.resource == request.resource.kind
         && grant.action == request.action
         && resource_id_matches(grant.resource_id.as_ref(), request.resource.id.as_ref())

@@ -1,71 +1,61 @@
-use std::collections::BTreeSet;
-
 use cloudiful_authz::{
-    Action, Authorizer, AuthorizerConfig, AuthzRequest, Capability, Decision, DomainHierarchy,
-    DomainId, FactsRevision, PrincipalId, PrincipalKind, PrincipalRef, ResourceKind, ResourceRef,
-    RoleAssignment, RoleId, RoleSpec, ServiceId, Subject,
+    Action, Authority, Authorizer, AuthorizerConfig, AuthzRequest, Capability, Decision,
+    DomainHierarchy, FactsRevision, PrincipalRef, ResourceKind, ResourceRef, RoleAssignment,
+    RoleId, RoleSpec, ServiceId, Subject,
 };
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let member = PrincipalRef {
-        kind: PrincipalKind::Human,
-        id: PrincipalId::new("42"),
-    };
-    let authorizer = Authorizer::new(AuthorizerConfig {
-        facts_revision: FactsRevision(1),
-        domains: vec![DomainId::new("team"), DomainId::new("team/docs")],
-        roles: vec![
+    let member = PrincipalRef::human("42");
+    let mut config = AuthorizerConfig::new(
+        FactsRevision(1),
+        ["team", "team/docs"],
+        [
             RoleSpec {
-                id: RoleId::new("viewer"),
-                capabilities: BTreeSet::from([Capability {
-                    resource: ResourceKind::new("content"),
-                    action: Action::new("read"),
-                }]),
+                id: RoleId::from("viewer"),
+                capabilities: [Capability::new("content", "read")].into(),
             },
             RoleSpec {
-                id: RoleId::new("maintainer"),
-                capabilities: BTreeSet::from([
-                    Capability {
-                        resource: ResourceKind::new("content"),
-                        action: Action::new("read"),
-                    },
-                    Capability {
-                        resource: ResourceKind::new("content"),
-                        action: Action::new("write"),
-                    },
-                ]),
+                id: RoleId::from("maintainer"),
+                capabilities: [
+                    Capability::new("content", "read"),
+                    Capability::new("content", "write"),
+                ]
+                .into(),
             },
         ],
-        assignments: vec![RoleAssignment {
-            principal: member.clone(),
-            role: RoleId::new("maintainer"),
-            domain: DomainId::new("team"),
-        }],
-        global_assignments: vec![],
-        hierarchy: DomainHierarchy {
-            edges: vec![(DomainId::new("team/docs"), DomainId::new("team"))],
-        },
-        public_read: BTreeSet::new(),
-    })
-    .await?;
+    );
+    config.assignments.push(RoleAssignment {
+        principal: member.clone(),
+        role: RoleId::from("maintainer"),
+        domain: "team".into(),
+    });
+    config.hierarchy = DomainHierarchy {
+        edges: vec![("team/docs".into(), "team".into())],
+    };
+    let authorizer = Authorizer::new(config).await?;
 
     let request = AuthzRequest {
-        subject: Subject::Principal(member),
-        domain: DomainId::new("team/docs"),
         resource: ResourceRef {
-            kind: ResourceKind::new("content"),
+            kind: ResourceKind::from("content"),
             id: None,
-            domain: DomainId::new("team/docs"),
+            domain: "team/docs".into(),
         },
-        action: Action::new("write"),
-        audience: ServiceId::new("docs-service"),
-        facts_revision: FactsRevision(1),
+        action: Action::from("write"),
+        audience: ServiceId::from("docs-service"),
         credential: None,
         server: None,
     };
+    let authority = Authority::Snapshot {
+        subject: Subject::Principal(member),
+        domain: "team/docs".into(),
+        facts_revision: FactsRevision(1),
+    };
 
-    assert!(matches!(authorizer.authorize(&request), Decision::Allow));
+    assert!(matches!(
+        authorizer.authorize(&request, authority),
+        Decision::Allow
+    ));
     println!("parent membership authorizes the child domain");
     Ok(())
 }

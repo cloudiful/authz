@@ -10,6 +10,14 @@ pub(crate) fn validate_identifier(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn validate_resolved_domain(value: &str) -> Result<(), String> {
+    validate_identifier(value)?;
+    if value == "*" {
+        return Err("resolved domain must not be a wildcard".to_owned());
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_service_id(value: &str) -> Result<(), String> {
     validate_identifier(value)?;
     if value == "*" {
